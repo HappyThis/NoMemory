@@ -30,7 +30,7 @@ NoMemory 是一个“记忆基础设施”：**只存原始事件（evidence）*
 ## 关键术语
 
 - **Event（事件）**：某个时刻发生的一条原始记录（对话、决策、工具调用、环境反馈等）。
-- **Query（查询）**：对事件集合的检索请求（时间/关键词/语义/过滤/排序/分页）。
+- **Query（查询）**：对事件集合的检索请求（时间/关键词/语义/过滤/分页；顺序通常由接口固定定义）。
 - **Recall（回忆）**：基于查询结果，由回忆 Agent 合成“记忆视图”的过程。
 - **Memory View（记忆视图）**：一次性生成的“当前可用记忆”（例如：用户偏好总结、可复用策略），应携带可追溯引用（event_id）。
 - **Skill（技能）**：一组可配置策略与工具编排，用于约束/提升回忆效果（召回范围、预算、脱敏、输出格式、引用要求、二次校验等）。
@@ -63,7 +63,13 @@ NoMemory 是一个“记忆基础设施”：**只存原始事件（evidence）*
 - `payload`：原始内容（JSON / 文本 / 结构化片段）
 - `tags`：可选标签
 - `embedding`：可选向量索引（派生物，允许存储）
-- `refs`：可选引用关系（例如 parent/span，用于链路追踪）
+- `refs`：可选引用关系（例如 parent/trace，用于线程与链路追踪）
+
+## 文档（Docs）
+
+- `docs/README.md`：文档目录与阅读顺序
+- `docs/query-api.md`：事件查询层接口（search / semantic_search / hybrid_search / aggregate / estimate / explain 等）
+- `docs/retrieval-skill-creator.md`：`retrieval-skill-creator`（生成检索类 skills 的生成器技能）文档
 
 ## Skills 能做什么
 
@@ -82,9 +88,8 @@ Skills 的目标是“同一份事件数据，用不同策略生成不同的记�
 
 ## 状态
 
-该仓库目前仅包含概念与约定的 README；后续可逐步补齐：
+该仓库目前仅包含概念与约定（含 `/docs`）；后续可逐步补齐：
 - 写入与查询 API（HTTP/gRPC/SDK）
 - Skills 格式与运行时
 - 回忆 Agent 的默认实现与示例 Skills
 - 可观测性与审计
-
