@@ -68,7 +68,8 @@ NoMemory 是一个“记忆基础设施”：**只存原始事件（evidence）*
 ## 文档（Docs）
 
 - `docs/README.md`：文档目录与阅读顺序
-- `docs/query-api.md`：事件查询层接口（search / semantic_search / hybrid_search / aggregate / estimate / explain 等）
+- `docs/query-api.md`：事件查询层接口（search / semantic_search / aggregate 等）
+- `docs/recall-agent-playbook.md`：回忆 Agent 如何使用查询接口合成记忆视图
 - `docs/retrieval-skill-creator.md`：`retrieval-skill-creator`（生成检索类 skills 的生成器技能）文档
 
 ## Skills 能做什么

@@ -77,7 +77,7 @@
   - 不建议/禁用的词条（例如 `disabled`）
 - `query_playbook`：
   - 多轮检索步骤（先粗后细）
-  - 何时用 `search`、何时用 `semantic_search`、何时用 `hybrid_search`
+  - 何时用 `search`、何时用 `semantic_search`
 - `output_contract`：
   - 必须引用 `event_id`
   - 必须声明不确定性（如 `confidence`）

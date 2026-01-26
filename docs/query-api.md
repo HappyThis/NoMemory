@@ -4,7 +4,7 @@
 
 ## 1. 设计目标
 
-- 支持多维检索：时间、结构化字段、关键词、语义向量、混合检索。
+- 支持多维检索：时间、结构化字段、关键词、语义向量。
 - 支持回放与溯源：按会话/链路追踪取回上下文，输出可引用的 `event_id`。
 - 硬隔离：保证 **right data, right principal**（不串租户/不串用户/不越权）。
 
@@ -146,7 +146,6 @@
 |---|---|---|
 | `scope` | 隔离范围对象（硬边界）；字段含义见 2.1。 | `{"tenant_id":"t_acme","user_id":"u_12345"}` |
 | `filter` | 过滤条件对象（软条件）；字段含义见 2.4。 | `{"event_types":["message"],"time_range":{"since":"2026-01-01T00:00:00Z"}}` |
-| `weights` | 混合检索融合权重对象（仅 hybrid，可选）。 | `{"lexical":0.6,"semantic":0.4}` |
 | `top_examples` | 聚合接口的示例返回控制对象（仅 aggregate，可选）。 | `{"per_bucket":2}` |
 
 **通用响应字段**
@@ -158,7 +157,6 @@
 | `highlights` | 高亮片段集合（可选）。 | `[{"event_id":"evt_01HTZ2...","snippets":["…我不吃辣…"]}]` |
 | `scores` | 分数集合（可选）。 | `[{"event_id":"evt_01HTZ2...","score":12.34}]` |
 | `buckets` | 聚合桶集合（仅 aggregate）。 | `[{"key":{"event_type":"error"},"metrics":{"count":17}}]` |
-| `plan` | explain 的执行计划摘要对象。 | `{"steps":["route by tenant_id"],"indexes":["idx_tenant_ts"]}` |
 | `error` | 错误对象（失败时返回）。 | `{"code":"FORBIDDEN","message":"tenant scope mismatch","retryable":false}` |
 
 ### 2.6 词表（Vocabulary）与“可扩展枚举”
@@ -368,66 +366,7 @@
 
 ---
 
-### 3.3 混合检索（关键词 + 语义）
-
-**接口**：`POST /v1/events/hybrid_search`
-
-**作用**
-- 同时做关键词召回（更精确）与语义召回（更覆盖），合并候选并重排。
-
-**输入**
-- `scope`
-- `filter`
-- `query_text: string`
-- `top_k?: number`：默认 20
-- `weights?: { lexical: number, semantic: number }`（可选）
-- `rerank?: "none"|"cross_encoder"|"llm"`（可选，默认 none）
-- `return_fields?: string[]`
-
-**字段说明与示例值（本接口新增字段）**
-
-| 字段 | 含义 | 示例值 |
-|---|---|---|
-| `top_k` | 返回条数上限。 | `20` |
-| `weights.lexical` | 关键词相关性权重。 | `0.6` |
-| `weights.semantic` | 语义相关性权重。 | `0.4` |
-| `rerank` | 二阶段重排方式：不重排/交叉编码器/LLM 重排。 | `cross_encoder` |
-
-**输出**
-- `items: (Event & { lexical_score?: number, semantic_score?: number, final_score: number })[]`
-
-**字段说明与示例值（本接口新增字段）**
-
-| 字段 | 含义 | 示例值 |
-|---|---|---|
-| `lexical_score` | 关键词检索分数（可选）。 | `8.90` |
-| `semantic_score` | 语义检索分数（可选）。 | `0.77` |
-| `final_score` | 融合/重排后的最终分数。 | `0.91` |
-
-**请求示例**
-
-```json
-{
-  "scope": { "tenant_id": "t_acme", "user_id": "u_12345" },
-  "filter": { "time_range": { "since": "2026-01-01T00:00:00Z" } },
-  "query_text": "不吃辣 火锅",
-  "top_k": 20,
-  "weights": { "lexical": 0.6, "semantic": 0.4 },
-  "rerank": "none",
-  "return_fields": ["event_id", "ts", "payload.text"]
-}
-```
-
-**使用场景**
-- 既要命中关键 token（如工具名/错误码），又要覆盖语义近似描述的 recall。
-
-**实现方式（自然语言）**
-- 并行跑倒排与向量检索得到两份候选；做 union 去重。
-- 用融合策略（如 RRF/线性加权）得到 `final_score`；可选二阶段重排（cross-encoder 或 LLM）。
-
----
-
-### 3.4 按 ID 精确读取
+### 3.3 按 ID 精确读取
 
 **接口**：`GET /v1/events/{event_id}`
 
@@ -456,7 +395,7 @@
 
 ---
 
-### 3.5 批量按 ID 读取
+### 3.4 批量按 ID 读取
 
 **接口**：`POST /v1/events/batch_get`
 
@@ -492,7 +431,7 @@
 
 ---
 
-### 3.6 邻域上下文（Neighbors）
+### 3.5 邻域上下文（Neighbors）
 
 **接口**：`GET /v1/events/{event_id}/neighbors`
 
@@ -528,7 +467,7 @@
 
 ---
 
-### 3.7 拉取会话事件（Session Replay）
+### 3.6 拉取会话事件（Session Replay）
 
 **接口**：`GET /v1/sessions/{session_id}/events`
 
@@ -562,7 +501,7 @@
 
 ---
 
-### 3.8 按 trace 拉取（可选）
+### 3.7 按 trace 拉取（可选）
 
 **接口**：`GET /v1/traces/{trace_id}/events`
 
@@ -586,7 +525,7 @@
 
 ---
 
-### 3.9 相似事件（以事件为查询）
+### 3.8 相似事件（以事件为查询）
 
 **接口**：`GET /v1/events/{event_id}/similar`
 
@@ -620,7 +559,7 @@
 
 ---
 
-### 3.10 聚合统计（给回忆 Agent 做“先粗后细”）
+### 3.9 聚合统计（给回忆 Agent 做“先粗后细”）
 
 **接口**：`POST /v1/events/aggregate`
 
@@ -695,119 +634,6 @@
 - 小规模可在线聚合但必须限窗限量；规模更大建议列存/OLAP 或预聚合视图。
 
 ---
-
-### 3.11 查询估算（让调用方决定“要不要回忆”）
-
-**接口**：`POST /v1/events/estimate`
-
-**作用**
-- 在执行查询前估算命中数/扫描量/耗时，便于调用方做预算控制与缓存策略。
-
-**输入**
-- 与 `search/semantic_search/hybrid_search` 相同的 query spec（任选一种）
-
-**输出**
-- `estimated_hits: number`
-- `estimated_scan: number`
-- `estimated_latency_ms: number`
-- `notes?: string[]`
-
-**字段说明与示例值**
-
-| 字段 | 含义 | 示例值 |
-|---|---|---|
-| `estimated_hits` | 预计命中条数（估算）。 | `1200` |
-| `estimated_scan` | 预计扫描量/候选量（估算）。 | `50000` |
-| `estimated_latency_ms` | 预计耗时毫秒（估算）。 | `180` |
-| `notes` | 提示与建议（例如“时间窗过大”）。 | `["time_range missing: consider adding since/until"]` |
-
-**使用场景**
-- 上游在“回忆很贵/很慢”时做门控：超过预算就缩小时间窗、降低 top_k 或直接跳过 recall
-
-**实现方式（自然语言）**
-- 基于索引统计信息与采样估算；不做全量扫描。
-
-**说明：estimate 输入如何组织**
-- `estimate` 的请求体复用 `search/semantic_search/hybrid_search` 的请求结构之一（任选其一）。
-- `estimate` 通常会忽略与“结果裁剪/分页”相关的字段（例如 `return_fields/page_size/cursor`），只根据范围与检索条件估算成本。
-
-**请求示例（对 search 进行估算）**
-
-```json
-{
-  "scope": { "tenant_id": "t_acme", "user_id": "u_12345" },
-  "filter": { "time_range": { "since": "2026-01-01T00:00:00Z" }, "event_types": ["message"] },
-  "query_text": "不吃辣 火锅"
-}
-```
-
-**响应示例**
-
-```json
-{
-  "estimated_hits": 1200,
-  "estimated_scan": 50000,
-  "estimated_latency_ms": 180,
-  "notes": ["consider narrowing time_range", "consider adding session_id or tags"]
-}
-```
-
----
-
-### 3.12 查询解释（Explain）
-
-**接口**：`POST /v1/events/explain`
-
-**作用**
-- 返回本次查询的执行计划摘要（便于调优与排障）。
-
-**输入**
-- 与任意查询相同的 query spec
-
-**输出**
-- `plan: { steps: string[], indexes: string[], warnings?: string[] }`
-
-**字段说明与示例值**
-
-| 字段 | 含义 | 示例值 |
-|---|---|---|
-| `plan.steps` | 执行步骤摘要（人可读）。 | `["route by tenant_id","apply time_range","BM25 search on search_text","rank by score"]` |
-| `plan.indexes` | 命中的索引名称（人可读）。 | `["idx_tenant_ts","inv_search_text"]` |
-| `plan.warnings` | 可能的性能/质量风险提示。 | `["no time_range; query may be slow"]` |
-
-**使用场景**
-- 线上排查召回慢/召回差：是不是没走时间窗、是不是没命中索引、是不是 filter 太宽
-
-**实现方式（自然语言）**
-- 暴露 query planner 的摘要，不泄露内部敏感实现细节。
-
-**请求示例（解释一次 search 会怎么执行）**
-
-```json
-{
-  "scope": { "tenant_id": "t_acme", "user_id": "u_12345" },
-  "filter": { "time_range": { "since": "2026-01-01T00:00:00Z" }, "event_types": ["message"] },
-  "query_text": "\"不吃辣\" AND 火锅"
-}
-```
-
-**响应示例**
-
-```json
-{
-  "plan": {
-    "steps": [
-      "route by tenant_id",
-      "apply time_range",
-      "BM25 search on search_text",
-      "rank by score",
-      "tie-break by ts desc + event_id"
-    ],
-    "indexes": ["idx_tenant_ts", "inv_search_text"],
-    "warnings": []
-  }
-}
-```
 
 ## 4. 错误模型（建议）
 
