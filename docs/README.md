@@ -1,27 +1,24 @@
 # Docs
 
-本目录包含 NoMemory 的概念与接口文档（以“事件证据”为中心，不存放现成记忆结论）。
+本目录包含 NoMemory 的版本化技术方案与接口文档。
 
 ## 建议阅读顺序
 
-1. `README.md`：项目理念与边界
-2. `docs/query-api.md`：查询层接口（如何召回事件证据）
-3. `docs/recall-agent-playbook.md`：回忆 Agent 如何使用 Query API
-4. `docs/retrieval-skill-creator.md`：`retrieval-skill-creator`（离线生成检索类 skills）
+1. `README.md`：总览（理念 + 版本）
+2. `docs/query-api.md`：v0（chat）Query API
+3. `docs/recall-agent-playbook.md`：v0（chat）回忆 Agent 技术方案
+4. `docs/retrieval-skill-creator.md`：v0（组件）creator skill 设计
 
 ## 文档列表
 
 - `docs/query-api.md`
-  - 事件查询接口：`search` / `semantic_search`
-  - 上下文与回放：`neighbors` / `session replay` / `trace replay`
-  - 统计：`aggregate`
+  - 消息查询接口：范围读取 / `lexical_search` / `semantic_search`
+  - 上下文：`neighbors`
 - `docs/recall-agent-playbook.md`
-  - 回忆 Agent 的标准流程（门控、收窄、召回、补上下文、合成与引用）
+  - 回忆 Agent 的自主闭环（假设 → 检索 → 反思 → 补上下文 → 合成与引用）
 - `docs/retrieval-skill-creator.md`
-  - 词表（vocabulary）与别名归一化如何“编译”进 retrieval skills（运行时不额外拉表）
+  - 如何设计一个 creator skill（标准 Agent Skill），用 Query API 为业务场景生成回忆 skill
 
 ## 约定
 
-- **接口返回的是事件证据**（events），而不是“记忆结论”。
-- **硬隔离优先**：任何查询都必须在服务端绑定 `tenant_id`（以及可选 `user_id/session_id`）。
-- **字段可控**：哪些字段由写入端/服务端生成、哪些允许客户端提供，应以 `docs/query-api.md` 的“字段所有权”章节为准。
+- **接口返回的是证据**（messages/events），而不是“记忆结论”。

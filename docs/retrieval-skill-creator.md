@@ -1,122 +1,145 @@
-# retrieval-skill-creator（文档草案）
+# v0 组件：retrieval-skill-creator（Agent Skill 设计）
 
-`retrieval-skill-creator` 是一个“生成 Skills 的 Skill”：它在**生成阶段**读取租户的词表/配置（vocabulary），把可用的枚举值、别名映射、推荐过滤器与默认检索策略“编译”进检索（retrieval）相关的 Skills 中，从而让运行时的搜索/回忆 Agent **不需要额外拉词表**也能稳定工作。
+本文定义一个“creator skill”（按 Claude Agent Skills 的标准组织为一个 Skill 目录 + `SKILL.md`）的设计：它通过多轮对话引导用户描述自己的业务场景，并基于 NoMemory v0（chat）的既有 Query API（见 `docs/query-api.md`）生成一份**回忆 skill**（同样是一个标准 Agent Skill），供回忆 Agent 直接加载执行。
 
-> 边界澄清：它不负责配置或生成写入侧的索引字段（例如 `search_text` 的抽取规则）。`search_text` 属于 NoMemory 写入/索引管道在入库时生成的内部字段；retrieval skills 关注的是“如何使用查询接口组织检索”（query_text/过滤器/别名归一化/预算等）。
+术语澄清（避免歧义）：
+- **creator skill**：生成其它 skills 的 skill（本文件描述的对象）
+- **回忆 skill**：给回忆 Agent 用的 skill（由 creator skill 产出）
+- 两者都是“标准 Agent Skill”（目录包含 `SKILL.md`，可选包含 `references/`、`scripts/` 等资源）
 
-## 1. 背景与目标
+## 1. 目标与边界
 
-### 背景
-- NoMemory 以“事件（Event）”为唯一权威来源，查询层负责召回证据，回忆 Agent 在上层合成记忆视图。
-- `actor_type / event_type / source / tags` 在实现上是 `string`，但在语义上需要“受控词表”，便于一致检索与治理。
-- 如果运行时 Agent 主动拉词表，会引入额外调用与延迟。
+### 1.1 目标
 
-### 目标
-- 让不同场景（agent 自进化 / chat 用户理解 / 其他业务场景）的检索策略只需更换 Skills。
-- 把词表与策略的“学习成本”前移到生成阶段：运行时只使用生成好的 Skills。
-- 生成结果可审计、可版本化、可回滚。
+- **默认可用**：用户只给一句场景描述，也能生成一份可用的检索策略（zero-config）。
+- **可定制**：用户补充业务信息后，creator skill 能自动优化回忆 skill 的内容（更稳的 query 改写、更合适的收窄策略、更清晰的证据契约）。
+- **只用现有接口**：回忆 skill 的运行时动作必须只依赖 `docs/query-api.md` 中的接口能力（即你为回忆 Agent 提供的 Query API 工具）。
 
-## 2. 核心思路（Compile vocab into skills）
+### 1.2 非目标
 
-- 系统维护两层词表：
-  - **系统默认词表（只读）**
-  - **租户覆盖词表（可写）**：新增/覆盖/禁用/废弃（deprecate）某些取值
-- `retrieval-skill-creator` 在生成阶段读取“合并视图”，产出面向某个场景的 retrieval skills：
-  - 可用的 `actor_type/event_type/source/tags` 子集（只注入检索所需最小集合）
-  - 别名/旧名 → 规范名（canonical）的映射
-  - 默认检索参数（时间窗、top_k、预算、过滤器优先级）
-  - 输出约束（例如必须引用 `event_id`）
-- 运行时的搜索/回忆 Agent 只加载 retrieval skills，不再主动请求词表。
+- 不负责执行回忆（不直接调用 Query API 做检索）。
+- 不规定存储/索引实现细节（ES、向量库等不在本文范围内）。
 
-## 3. 输入（Input）
+## 2. Creator Skill 的“多轮交互”设计
 
-`retrieval-skill-creator` 的输入是“场景 + 词表快照 + 策略模板”。
+creator skill 的核心能力不是“填表”，而是：**发现缺信息 → 用最少问题补齐 → 产出可加载的回忆 skill**。
 
-### 3.1 场景（Scenario）
-用于决定生成哪一类 retrieval skills，例如：
-- `chat.user_memory`
-- `agent.self_evolve`
-- `biz.<domain>.<use_case>`
+### 2.1 触发方式（建议）
 
-### 3.2 词表快照（Vocabulary Snapshot）
-词表是逻辑概念，不限定存储方式（表/文件/API）。
+当用户表达类似意图时触发：
+- “为我的业务生成/定制记忆检索策略”
+- “帮我做一份回忆 skill”
+- “我想让回忆更适合 XXX 场景”
 
-最低要求：
-- 有系统默认词表与租户覆盖词表的合并结果
-- 每个词条至少包含：
-  - `type`: `actor_type` / `event_type` / `source` / `tag`
-  - `key`: 实际写入事件的字符串值（canonical）
-  - `status`: `active` / `deprecated` / `disabled`
-  - `aliases`: 可选（旧名/同义词）
-  - `description/examples`: 可选（给生成器理解语义）
+### 2.2 交互策略（强约束）
 
-### 3.3 策略模板（Template）
-模板决定生成结果的形态与约束（强烈建议结构化模板，而不是自由文本）：
-- 默认过滤器组合（scope + filter）
-- 召回阶段划分（关键词/语义/混合）
-- 输出 schema（例如 JSON 结构、引用字段、置信度字段）
+- **最多 3 个澄清问题**：除非用户明确愿意继续补充，否则不超过 3 个问题。
+- **优先给选项**：用 A/B/C 选项降低用户输入成本；允许用户只回复 “A”。
+- **先产出再迭代**：信息不全也先给一个默认版本；再提供“你补充 X，我能改进 Y”的增量路径。
 
-## 4. 输出（Output）
+### 2.3 必问信息（最小集）
 
-输出是一份可直接被运行时加载的 retrieval skill（或 skill bundle）。
+1) **场景描述**（用户一句话即可）
+2) **记忆用途**（输出拿来干什么：个性化建议/写邮件/提醒/风格适配/总结）
+3) **证据契约**（至少确认 `role` 与是否需要 `neighbors`）
 
-建议包含：
-- `skill_id`: 例如 `retrieval.chat.user_memory.v1`
-- `scenario`: 与输入一致
-- `vocab_version`（或 `vocab_hash`）：用于一致性校验与再生成触发
-- `canonicalization`：
-  - `event_type_aliases`: `alias -> canonical`
-  - `tag_aliases`: `alias -> canonical`
-  - （可选）`actor_type_aliases` / `source_aliases`
-- `defaults`：
-  - `time_range_default`（例如最近 30 天）
-  - `top_k_default`
-  - `budget`（例如最大扫描量/最大 token/最大轮数）
-- `recommended_filters`：
-  - 场景常用的 `event_types/tags` 子集
-  - 不建议/禁用的词条（例如 `disabled`）
-- `query_playbook`：
-  - 多轮检索步骤（先粗后细）
-  - 何时用 `search`、何时用 `semantic_search`
-- `output_contract`：
-  - 必须引用 `event_id`
-  - 必须声明不确定性（如 `confidence`）
-  - 不输出敏感字段（best-effort，可与调用方策略叠加）
+若用户不愿回答，则采用默认值（见 3.2）。
 
-> 注：本仓库暂不规定 skills 的具体文件格式（YAML/JSON/代码），这里只定义应包含的语义信息。
+### 2.4 可选信息（用于增强）
 
-## 5. 版本化与再生成（Versioning）
+- 领域词典（术语/缩写/别名）
+- 时间分布偏好（更偏“最近”还是“长期”）
+- 噪声来源（线索是否常出现在 assistant 总结里）
 
-### 5.1 为什么需要版本
-- 词表变化会影响检索策略与别名归一化；不版本化会导致运行时行为漂移。
+## 3. 生成物（回忆 skill）规范
 
-### 5.2 建议的版本策略
-- retrieval skills 内写入 `vocab_version/hash`
-- 当词表变更（新增/废弃/禁用/别名变化）时触发再生成
-- 支持回滚到旧 skills（与旧词表版本兼容时）
+### 3.1 生成物用途
 
-### 5.3 运行时校验（不额外调用的前提下）
-运行时不拉词表，但可以：
-- 将 `vocab_version` 作为观测字段上报/日志打印
-- 当发现服务端返回 `warnings: vocab_mismatch`（可选机制）时，由调用方后台触发再生成并更新 skills
+回忆 Agent 加载生成物后，按其中的策略把用户问题改写为 Query API 请求，并在召回证据后合成 `memory_view`。
 
-## 6. 使用方式（How it fits the system）
+### 3.1.1 生成物的“标准 Skill 目录”形态（建议）
 
-推荐流程：
-1. 租户配置/更新词表（覆盖表）
-2. 触发 `retrieval-skill-creator` 生成对应场景的 retrieval skills
-3. 上游服务把生成结果作为运行时配置下发（或打包发布）
-4. 搜索/回忆 Agent 运行时只依赖 retrieval skills + 查询层 API
+回忆 skill 建议输出为一个目录（可被打包/安装为 Agent Skill），例如：
 
-## 7. 边界与非目标（Non-goals）
+```
+nomemory-recall-<your-domain>/
+  SKILL.md
+  references/
+    query-api.md        # 可选：摘录项目 Query API 要点（不是实现细节）
+    lexicon.md          # 可选：领域词典与同义扩展说明
+```
 
-- 不在 NoMemory 内部持久化“现成记忆结论”（仍遵循 NoMemory 的 evidence-first 原则）
-- 不承担最终内容安全裁决：skills 可以尽力约束/标注风险，但是否采纳由调用方决定
-- 不强制规定词表存储实现与 skills 文件格式（这属于后续工程化决策）
+其中 `SKILL.md` 的 YAML frontmatter 只包含：
+- `name`
+- `description`
 
-## 8. 一个直观例子（概念层）
+### 3.2 默认策略（zero-config）
 
-当租户把 `event_type` 规范成命名空间（例如 `chat.message`、`tool.call`、`tool.result`），并把旧值 `message/tool_call/tool_result` 作为 `aliases`：
+当用户只给一句场景描述时，采用以下默认：
+- `time_range_default`: 最近 30 天（运行时换算为 `since/until`）
+- `role_default`: `user`（偏好/画像类默认只看用户输入）
+- 检索优先级：偏好/背景/约束类优先 `semantic_search`；关键词很明确时优先 `lexical_search`
+- `neighbors`: 对 top 命中默认开启（例如 `before=10`），避免断章取义
 
-- `retrieval-skill-creator` 会把这些映射写进 retrieval skills
-- 运行时 Agent 即使仍用旧词（或用户自然语言里出现旧词），也能通过 skills 指导把查询重写为 canonical 值，从而稳定命中索引与过滤条件
+### 3.3 回忆 skill（`SKILL.md`）内容结构（建议）
+
+回忆 skill 不是“机器解析的配置文件”，而是一份会被 Agent 直接阅读并遵循的技能说明。建议在 `SKILL.md` 里固定如下章节，保证每个业务定制 skill 都“可读、可执行、可追溯”：
+
+- **Frontmatter**
+  - `name`：例如 `nomemory-recall-crm`
+  - `description`：描述该回忆 skill 适用的业务场景与目标
+- **Scenario**
+  - 场景描述原文（用户给的一句话）
+- **Defaults**
+  - `time_range_default`（示例：`P30D`，运行时换算成 `since/until`）
+  - `role_default`（示例：`user`，或留空表示不限定）
+  - `top_k_default`（示例：`20`）
+- **Lexicon（可选）**
+  - 领域词典（canonical → 别名列表），用于 query 改写/扩展
+- **Query Templates**
+  - 按意图列模板：`preferences/profile/constraints/schedule`
+  - 每个模板写清：首选工具（`lexical_search`/`semantic_search`/范围读取）、query_text 改写规则、何时需要 `neighbors`
+- **Playbook**
+  - 命中太多/太少时如何扩/缩时间窗、是否切换 lexical/semantic、何时停止
+- **Evidence Contract**
+  - 证据必须包含字段：`message_id/ts/role/content`
+  - 输出必须声明覆盖范围：`time_range/role`
+
+## 4. 生成过程（自然语言工作流）
+
+creator skill 的生成流程建议固定为：
+
+1) **理解场景**：从场景描述里识别记忆用途与重点信息（偏好/背景/约束/日程）。
+2) **最少澄清**：缺少“证据契约/时间分布/领域术语”就提问；能给选项就给选项。
+3) **产出回忆 skill**：填充默认策略，保证可执行。
+4) **自检**（强制）：
+   - 是否只使用 `docs/query-api.md` 的接口能力？
+   - `role_default` 是否为 `user/assistant/system` 或为空？
+   - `time_range_default` 是否可换算成 `since/until`？
+   - `output_contract` 是否包含可核对证据字段？
+5) **给出可选增强点**：提示用户补充领域词典/时间分布偏好能提升效果。
+
+## 5. 例子：用户只给一句话
+
+用户输入：
+> “我是 CRM 销售助手，想记住客户信息、沟通偏好与跟进事项，用于写跟进邮件。”
+
+creator skill（可选澄清，最多 3 问）：
+1) “证据默认只看用户输入吗？A 只看 user；B user+assistant；C 不限定”
+2) “默认时间窗？A 7 天；B 30 天；C 180 天”
+3) “要不要提供几个你们常用术语/缩写（可选）？”
+
+若用户只回复：
+> “B”
+
+则把 `role_default` 设置为不限定（或显式允许 `user+assistant`），并生成一份可加载的回忆 skill。
+
+## 6. 与 Query API 的对应关系（约束）
+
+生成物最终只能映射到以下接口调用组合（来自 `docs/query-api.md`）：
+- `GET /v1/users/{user_id}/messages`：范围读取（按分页游标遍历）
+- `POST /v1/messages/lexical_search`：关键词检索
+- `POST /v1/messages/semantic_search`：语义检索
+- `GET /v1/users/{user_id}/messages/{message_id}/neighbors`：邻域上下文补齐
+
+creator skill 生成的任何回忆 skill，都必须能落到上述调用上，不引入“解释/估算/聚合/批量获取”等额外能力。

@@ -2,9 +2,10 @@
 
 NoMemory 是一个“记忆基础设施”：**只存原始事件（evidence）**，不持久化“现成的记忆结论”；在需要时通过“回忆（recall）”按场景合成可用的记忆视图（memory view）。
 
-它的目标是用同一套底座服务两类系统，并通过简单配置/Skills 实现差异化：
-- **Agent 系统（自进化）**：记录决策、工具调用、环境反馈等事件，在需要时回忆并总结可复用策略。
-- **Chat 类 Agent（用户理解）**：记录用户-助手交互事件，在需要时回忆并生成用户偏好/背景的临时视图。
+## 技术方案版本
+
+- **v0：Chat 用户记忆**（本仓库当前方案）：围绕“用户-消息”构建可检索的对话证据库，并由回忆 Agent 在查询结果之上合成用户记忆视图。
+- **v0：检索 skill 生成器（retrieval-skill-creator）**：在不改 Query API 的前提下，为不同回忆场景生成回忆 skill（标准 Agent Skill，见 `docs/retrieval-skill-creator.md`）。
 
 ## 核心理念
 
@@ -16,70 +17,54 @@ NoMemory 是一个“记忆基础设施”：**只存原始事件（evidence）*
 
 1. **事件层（Event Log）**
    - 只负责可靠地写入/存储/检索“发生过的原始事件”
-   - 事件是宽泛概念：对 agent 场景可以是每个节点的决策信息与环境反馈；对 chat 场景可以是对话轮次与元信息
+   - v0（chat）中事件以对话消息为核心：一个 `user_id` 对应一条按时间排序的消息序列
 
 2. **查询层（Query Layer / Recall API）**
    - 在事件之上提供多维检索能力（可组合）
-   - 典型维度：时间窗、关键词/标签、结构化过滤、语义向量（embedding）相似度等
+   - 典型维度：时间窗、关键词检索、语义检索、邻域上下文等
 
 3. **适配层（回忆 Agent + Skills）**
+   - 回忆 Agent = Agent + 可加载的回忆 Skill（标准 Agent Skill）
    - 回忆 Agent 使用查询层工具进行多轮检索与重写查询
    - 将召回的事件“合成”为一次性记忆视图（memory view），供调用方选择是否采纳
    - 不做“记忆裁决”：不强行解决冲突、不把结论写回为长期记忆（除非调用方另行存储）
 
 ## 关键术语
 
-- **Event（事件）**：某个时刻发生的一条原始记录（对话、决策、工具调用、环境反馈等）。
-- **Query（查询）**：对事件集合的检索请求（时间/关键词/语义/过滤/分页；顺序通常由接口固定定义）。
+- **Message（消息）**：chat 场景的一条对话消息（用户/助手/system）。
+- **Query（查询）**：对消息集合的检索请求（时间/关键词/语义/过滤/分页；顺序通常由接口固定定义）。
 - **Recall（回忆）**：基于查询结果，由回忆 Agent 合成“记忆视图”的过程。
-- **Memory View（记忆视图）**：一次性生成的“当前可用记忆”（例如：用户偏好总结、可复用策略），应携带可追溯引用（event_id）。
-- **Skill（技能）**：一组可配置策略与工具编排，用于约束/提升回忆效果（召回范围、预算、脱敏、输出格式、引用要求、二次校验等）。
-
-## 责任边界（建议的产品契约）
-
-- **基础设施必须硬保证**
-  - 正确可达：取对租户/用户/会话，避免越权访问与串数据
-  - 可靠性：写入与查询的稳定性、可观测性（日志/指标/审计）
-
-- **Skills 提供软约束（可选、可替换）**
-  - 召回策略：检索步骤、查询重写、聚合方式、输出模板、引用规范（例如必须引用 event_id）
-  - 内容处理：尽力过滤/脱敏/风险标注（best-effort）
-
-- **调用方做最终裁决**
-  - 是否触发回忆、是否缓存、是否采用回忆结果进入上下文/决策链
-  - 可叠加内容安全：敏感词/分类器/规则引擎/人工审核等
-
-一句话：NoMemory 保证 **right data, right principal**；不保证 **safe/allowed for this use-case**，后者由 Skills + 调用方策略完成。
+- **Memory View（记忆视图）**：一次性生成的“当前可用记忆”（例如：用户偏好/背景），应携带可追溯引用（`message_id`）。
+- **Skill（技能）**：一组可配置策略与工具编排，用于约束/提升回忆效果（召回范围、查询改写、输出格式、引用要求、覆盖范围声明等）。
+  - 在本文档体系里，Skill 以“标准 Agent Skill”的形式存在（Skill 目录 + `SKILL.md`）。
 
 ## 事件模型（最小建议）
 
 > 下面是概念性字段，具体可按你的实现裁剪/扩展。
 
-- `event_id`：事件唯一标识
-- `ts`：事件时间戳
-- `tenant_id` / `user_id` / `session_id`：隔离与归属
-- `source`：`agent` / `chat` / `tool` / `env`
-- `event_type`：例如 `decision` / `message` / `tool_call` / `feedback`
-- `payload`：原始内容（JSON / 文本 / 结构化片段）
-- `tags`：可选标签
+v0（chat 消息）建议字段：
+
+- `message_id`：消息唯一标识
+- `ts`：消息时间戳
+- `user_id`：用户标识
+- `role`：`user` / `assistant` / `system`
+- `content`：消息正文
 - `embedding`：可选向量索引（派生物，允许存储）
-- `refs`：可选引用关系（例如 parent/trace，用于线程与链路追踪）
 
 ## 文档（Docs）
 
 - `docs/README.md`：文档目录与阅读顺序
-- `docs/query-api.md`：事件查询层接口（search / semantic_search / aggregate 等）
-- `docs/recall-agent-playbook.md`：回忆 Agent 如何使用查询接口合成记忆视图
-- `docs/retrieval-skill-creator.md`：`retrieval-skill-creator`（生成检索类 skills 的生成器技能）文档
+- `docs/query-api.md`：v0（chat）查询接口（范围读取 / lexical_search / semantic_search / neighbors 等）
+- `docs/recall-agent-playbook.md`：v0（chat）回忆 Agent 技术方案（如何检索与合成）
+- `docs/retrieval-skill-creator.md`：v0（组件）creator skill 设计（生成回忆 skill）
 
 ## Skills 能做什么
 
 Skills 的目标是“同一份事件数据，用不同策略生成不同的记忆视图”。常见能力：
 
-- **召回范围**：限定时间窗、限定事件类型、限定标签/来源、限定 topK/预算
-- **检索编排**：多轮查询、查询重写、分阶段召回（粗召回→精召回）
-- **输出约束**：固定结构（JSON schema）、必须给出 `event_id` 引用、置信度与不确定性表达
-- **内容处理**：脱敏、风险标注、允许/禁止字段下发（best-effort）
+- **召回范围**：默认时间窗、是否只看 `role=user`
+- **检索编排**：多轮查询、查询重写（更好的 `query_text`）、必要时补 `neighbors`
+- **输出约束**：固定结构、必须给出 `message_id` 引用、声明覆盖范围（limits）
 
 ## 非目标（Non-goals）
 
@@ -89,8 +74,4 @@ Skills 的目标是“同一份事件数据，用不同策略生成不同的记�
 
 ## 状态
 
-该仓库目前仅包含概念与约定（含 `/docs`）；后续可逐步补齐：
-- 写入与查询 API（HTTP/gRPC/SDK）
-- Skills 格式与运行时
-- 回忆 Agent 的默认实现与示例 Skills
-- 可观测性与审计
+该仓库目前以文档形式给出技术方案；可按版本逐步落地为实现与示例。
