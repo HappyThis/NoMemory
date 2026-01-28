@@ -2,6 +2,9 @@
 
 本文定义 v0 方案的查询接口。数据对象为对话消息（message），组织方式为：一个 `user_id` 对应一条按时间排序的消息序列。
 
+使用约定：
+- 在真实服务中，建议由服务端从可信上下文绑定 `user_id`，并通过工具装饰器把 `user_id` 注入到查询调用中；回忆 Agent 不应自行选择 `user_id`（见 `docs/recall-service.md`）。
+
 ## 1. 数据模型
 
 ### 1.1 ChatMessage

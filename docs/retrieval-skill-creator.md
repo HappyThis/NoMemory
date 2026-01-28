@@ -101,6 +101,7 @@ nomemory-recall-<your-domain>/
   - 每个模板写清：首选工具（`lexical_search`/`semantic_search`/范围读取）、query_text 改写规则、何时需要 `neighbors`
 - **Playbook**
   - 命中太多/太少时如何扩/缩时间窗、是否切换 lexical/semantic、何时停止
+  - 发现证据冲突时如何继续检索并尽力裁决（必要时对双方证据都取 `neighbors`）
 - **Evidence Contract**
   - 证据必须包含字段：`message_id/ts/role/content`
   - 输出必须声明覆盖范围：`time_range/role`
@@ -116,7 +117,7 @@ creator skill 的生成流程建议固定为：
    - 是否只使用 `docs/query-api.md` 的接口能力？
    - `role_default` 是否为 `user/assistant/system` 或为空？
    - `time_range_default` 是否可换算成 `since/until`？
-   - `output_contract` 是否包含可核对证据字段？
+   - Evidence Contract 是否包含可核对证据字段？
 5) **给出可选增强点**：提示用户补充领域词典/时间分布偏好能提升效果。
 
 ## 5. 例子：用户只给一句话

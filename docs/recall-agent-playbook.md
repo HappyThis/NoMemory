@@ -16,11 +16,13 @@
 
 ### 2.1 输入（Input）
 
-- `user_id`
 - `question`：本次要回答的问题/任务（自然语言）
 - `context`（可选）
   - `time_range`：默认时间窗（例如最近 30 天；若不提供则使用回忆 skill 的默认值）
   - `role_pref`：例如偏好只看 `role=user`（若不提供则使用回忆 skill 的默认值）
+
+说明：
+- `user_id` 由“检索服务/运行时框架”从可信上下文绑定并注入到工具层，回忆 Agent 不应也无需决定/填写 `user_id`。
 
 ### 2.2 输出（Output）
 
@@ -48,16 +50,33 @@
 
 ## 3. 工具集（Query API）
 
-- 范围读取：`GET /v1/users/{user_id}/messages`
-- 关键词检索：`POST /v1/messages/lexical_search`
-- 语义检索：`POST /v1/messages/semantic_search`
-- 邻域上下文：`GET /v1/users/{user_id}/messages/{message_id}/neighbors`
+回忆 Agent 看到的工具应当是“已绑定 user 的工具”（不暴露 `user_id` 参数）。底层实现依然可以复用 `docs/query-api.md` 的 HTTP 接口，只是在服务端通过装饰器/中间件注入 `user_id`。
+
+- 范围读取：`messages_list(since, until, role, page_size, cursor)`
+- 关键词检索：`lexical_search(query_text, filter, page_size, cursor)`
+- 语义检索：`semantic_search(query_text|query_embedding, filter, top_k, min_score)`
+- 邻域上下文：`neighbors(message_id, before, after)`
+
+> 参考：`docs/recall-service.md` 给出“检索服务 + 工具装饰器注入 user_id”的推荐实现方式（自然语言）。
 
 ## 4. 自主检索闭环（Observe → Reflect → Decide）
 
 回忆 Agent 的核心不是固定流程，而是闭环决策。
 
-### 4.1 假设（Hypotheses）
+### 4.0 4.x 与闭环的对应关系（速查）
+
+> 4.x 的每个子项都可以落到 Observe / Reflect / Decide 三类动作中。实际运行时会按需循环多轮：Decide 发起检索 → Observe 读结果 → Reflect 自检 → Decide 调整策略或停止。
+
+- **Observe（观察）**：4.1（从问题提炼可验证假设）、4.2（从问题抽取时间/角色/锚点等信号并形成可执行的过滤条件）、4.6.1（补证与取证）。
+- **Reflect（自检）**：4.4（相关性/上下文/覆盖/重复/冲突）、4.6.2（冲突归因）。
+- **Decide（决策）**：4.2（收窄动作的取舍与调参）、4.3（选检索方式）、4.5（停不停）、4.6.3（裁决动作与输出）。
+
+### 4.1 假设（Hypotheses / Observe）
+把“问题”变成“可检索可验证”的目标，通常分两步：
+
+- **Observe**：从 `question` 里识别它在问哪类记忆（偏好/背景/约束）、是否包含时间/对象/场景/指代（例如“上次/那个/最近/是不是说过”）。
+- **Decide**：选定 1~3 条可被证据支持的假设，并明确“什么样的消息算证据”（例如必须是 `role=user` 原话、必须有明确否定/肯定措辞、必须在指定时间窗内等）。
+
 先把问题拆成 1~3 个“可被证据支持”的假设：
 - 偏好类：饮食/作息/语言/格式偏好
 - 背景类：地点/职业/项目/长期目标
@@ -74,8 +93,13 @@
 | “我们上次聊到的那个项目进展怎样了？” | 1) 存在“项目 A”的连续讨论；2) 需要找到最近一次提及该项目的上下文串 | 先 `semantic_search`（“上次/那个项目/进展/需求”等），再对关键命中用 `neighbors` 扩展上下文 |
 | “我最近有什么重要日程/要办的事？” | 1) 用户在近段时间提到过待办/日程/截止日期；2) 时间线比语义更关键 | 先 `GET .../messages` 做时间范围扫读（例如最近 7/30 天），再在命中的片段上做 `lexical_search` 补关键词（如“截止/会议/预约/DDL”） |
 
-### 4.2 收窄（Narrow）
+### 4.2 收窄（Narrow / Observe + Decide）
 收窄的目标：在不牺牲召回率的前提下，尽快把候选集压到“可读、可核对”的规模。
+
+可以把收窄理解成两段：
+
+- **Observe**：从 `question` 抽取时间/角色/指代/关键词等“可操作信号”。
+- **Decide**：把信号落实为 `time_range` / `role` / `query_text` 约束，以及“先找锚点再扩上下文”等动作。
 
 **(1) 用时间窗先砍一刀**
 
@@ -87,8 +111,13 @@
 
 请求形态（范围读取）示例：
 
-```http
-GET /v1/users/u_12345/messages?since=2026-01-01T00:00:00Z&until=2026-02-01T00:00:00Z&role=user&page_size=100
+```text
+messages_list(
+  since="2026-01-01T00:00:00Z",
+  until="2026-02-01T00:00:00Z",
+  role="user",
+  page_size=100
+)
 ```
 
 **(2) 用 `role` 过滤去掉“复述噪声”**
@@ -105,17 +134,17 @@ GET /v1/users/u_12345/messages?since=2026-01-01T00:00:00Z&until=2026-02-01T00:00
 
 示例（先短语命中，再取上下文）：
 
-```json
-POST /v1/messages/lexical_search
-{
-  "user_id": "u_12345",
-  "filter": { "role": "user", "time_range": { "since": "2026-01-01T00:00:00Z" } },
-  "query_text": "\"不吃辣\""
-}
-```
+```text
+lexical_search(
+  query_text="\"不吃辣\"",
+  filter={ "role": "user", "time_range": { "since": "2026-01-01T00:00:00Z" } }
+)
 
-```http
-GET /v1/users/u_12345/messages/m_01HTZ2K8J9Q1ZQ4QYQ8M9J7P6A/neighbors?before=10&after=0
+neighbors(
+  message_id="m_01HTZ2K8J9Q1ZQ4QYQ8M9J7P6A",
+  before=10,
+  after=0
+)
 ```
 
 **(4) “太多/太少”两种情况的收窄动作**
@@ -129,7 +158,7 @@ GET /v1/users/u_12345/messages/m_01HTZ2K8J9Q1ZQ4QYQ8M9J7P6A/neighbors?before=10&
   - 从 `lexical_search` 切到 `semantic_search`（同义改写多时）
   - 去掉 `role` 限定（用户可能“让助手转述/总结”导致线索在 assistant 侧）
 
-### 4.3 选择检索方式（Choose）
+### 4.3 选择检索方式（Choose / Decide）
 
 | 场景信号 | 优先工具 |
 |---|---|
@@ -137,17 +166,52 @@ GET /v1/users/u_12345/messages/m_01HTZ2K8J9Q1ZQ4QYQ8M9J7P6A/neighbors?before=10&
 | 同义改写明显（偏好/背景自然语言） | `semantic_search` |
 
 ### 4.4 自检与改写（Reflect）
-每轮检索后执行自检，并决定下一步：
+每轮检索后执行自检（Reflect），并把自检结果转成下一步动作（Decide）：
+
+**Reflect：检查本轮命中质量**
 - **相关性**：命中是否与假设一致？（否→改 query_text 或更换检索方式）
 - **上下文**：是否存在断章取义风险？（是→对关键命中用 `neighbors`）
 - **覆盖性**：是否遗漏明显线索？（是→扩大时间窗或放宽 `role` 限定）
 - **重复性**：是否反复命中同一组消息？（是→停止或切换策略）
+- **冲突**：同一假设是否出现相互矛盾的证据？（是→进入“冲突裁决”并继续检索）
 
-### 4.5 停止条件（Stop）
+**Decide：把检查结果落到动作上**
+- 调整 `time_range` / `role` / `query_text`（见 4.2），切换 `lexical_search` vs `semantic_search`（见 4.3）。
+- 对关键证据补 `neighbors`，再回到 Observe 读上下文。
+- 若满足停止条件则停止（见 4.5）；若出现冲突则进入裁决（见 4.6）。
+
+### 4.5 停止条件（Stop / Decide）
 满足任一即可停止检索并进入合成：
 - 已有足够证据支撑主要结论（且可引用）
 - 继续检索的边际收益很低
 - 继续检索会明显引入噪声
+
+### 4.6 冲突裁决（Adjudicate）
+当同一假设出现相互矛盾的证据时，回忆 Agent 不应直接并列输出结束，而应**优先继续检索以尽力裁决**。裁决本身也应遵循闭环：Observe → Reflect → Decide（并可能循环多轮）。
+
+#### 4.6.1 补证与取证（Observe）
+目标：把“冲突”从抽象判断变成可核对的证据集合。
+
+1) **补上下文**：对双方关键证据都调用 `neighbors`，确认是否为断章取义、转述、假设语气、玩笑/反讽，或其实已在上下文中被更正。
+2) **找“更明确/更近”的表述**：扩大或移动 `time_range`，优先寻找更晚的、表述更明确的用户原话（例如“现在开始我不吃辣了”）。
+3) **多路召回补证**：
+   - 用 `lexical_search` 做精确短语追溯（同一关键短语在不同时间点的出现）
+   - 用 `semantic_search` 找同义改写（例如“少辣/怕辣/不吃辣”）
+
+#### 4.6.2 冲突归因（Reflect）
+对已收集的证据做冲突归因，避免“看起来矛盾但其实不矛盾”：
+
+- **语境误判**：某条证据出现在假设/引用/转述/条件句里，或主体不是用户本人。
+- **时间变化**：两条都真实，但代表用户偏好/状态在不同时间点发生变化（此时更晚、更明确的表述优先）。
+- **来源可信度差异**：用户原话与助手复述冲突时，默认优先用户原话；必要时放宽 `role` 去找助手侧“引用的用户原话”锚点再回溯。
+- **证据不足**：两边都只有模糊线索，缺少能一锤定音的明确表述。
+
+#### 4.6.3 裁决动作与输出（Decide）
+根据归因决定下一步与最终输出形态：
+
+- **可裁决**：输出裁决后的结论，并引用支撑裁决的证据（必要时同时引用被否定证据，并说明其被否定的原因：语境/时间变化/转述不可靠）。
+- **需继续检索**：回到 4.6.1，调整 `time_range` / `role` / `query_text`，直到满足 4.5 的停止条件。
+- **不可裁决**：并列输出多种可能，并在 `memory_view` 中标注不确定性（例如“可能已变化/证据不足”），同时列出双方证据与各自语境说明。
 
 ## 5. 合成策略（Synthesis）
 
@@ -155,7 +219,7 @@ GET /v1/users/u_12345/messages/m_01HTZ2K8J9Q1ZQ4QYQ8M9J7P6A/neighbors?before=10&
 
 - **只提取与当前问题相关的最小信息**
 - **每条要点带证据**：附 1~N 条原文消息片段（必要时补上邻域上下文）
-- **冲突不裁决**：若证据矛盾，输出两种说法并各自引用
+- **冲突尽力裁决**：若证据矛盾，优先按“冲突裁决”继续检索；仍无法裁决时再并列输出并标注不确定性
 
 ## 6. 示例：回忆饮食偏好
 
@@ -163,7 +227,7 @@ GET /v1/users/u_12345/messages/m_01HTZ2K8J9Q1ZQ4QYQ8M9J7P6A/neighbors?before=10&
 
 1) 假设：用户说过“不吃辣/忌口/过敏”等  
 2) 收窄：`role=user` + `time_range=最近30天`  
-3) 语义检索：`POST /v1/messages/semantic_search`，`query_text="不吃辣 忌口 过敏 饮食偏好"`  
+3) 语义检索：`semantic_search(query_text="不吃辣 忌口 过敏 饮食偏好")`  
 4) 对 top 命中做 `neighbors`，确认是否为用户原话且语境为真实偏好  
 5) 将命中的原文作为证据输出，合成：
 - `memory_view.preferences=["不吃辣"]`

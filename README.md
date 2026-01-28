@@ -24,10 +24,10 @@ NoMemory 是一个“记忆基础设施”：**只存原始事件（evidence）*
    - 典型维度：时间窗、关键词检索、语义检索、邻域上下文等
 
 3. **适配层（回忆 Agent + Skills）**
-   - 回忆 Agent = Agent + 可加载的回忆 Skill（标准 Agent Skill）
+   - 回忆 Agent = Agent + 可加载的回忆 skill（标准 Agent Skill）
    - 回忆 Agent 使用查询层工具进行多轮检索与重写查询
    - 将召回的事件“合成”为一次性记忆视图（memory view），供调用方选择是否采纳
-   - 不做“记忆裁决”：不强行解决冲突、不把结论写回为长期记忆（除非调用方另行存储）
+   - 不固化“裁决结果”：回忆时可通过继续检索尽力裁决，但不把结论写回为长期事实（除非调用方另行存储）
 
 ## 关键术语
 
@@ -55,6 +55,7 @@ v0（chat 消息）建议字段：
 
 - `docs/README.md`：文档目录与阅读顺序
 - `docs/query-api.md`：v0（chat）查询接口（范围读取 / lexical_search / semantic_search / neighbors 等）
+- `docs/recall-service.md`：v0（组件）检索服务（绑定 user_id 并向 Agent 暴露不含 user_id 的工具）
 - `docs/recall-agent-playbook.md`：v0（chat）回忆 Agent 技术方案（如何检索与合成）
 - `docs/retrieval-skill-creator.md`：v0（组件）creator skill 设计（生成回忆 skill）
 
@@ -69,7 +70,7 @@ Skills 的目标是“同一份事件数据，用不同策略生成不同的记�
 ## 非目标（Non-goals）
 
 - 不把“总结后的记忆”作为系统内的事实来源长期保存
-- 不做统一的冲突裁决/真值判定（可由 Skills 或调用方实现）
+- 不在存储层固化“真值”（回忆时可通过继续检索尽力裁决，但不把裁决结果写回为长期事实）
 - 不强制规定调用方如何缓存/是否回忆（NoMemory 提供原语与契约）
 
 ## 状态
