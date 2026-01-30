@@ -1,0 +1,17 @@
+from fastapi import FastAPI
+
+from app.api.ingest import router as ingest_router
+from app.api.query import router as query_router
+from app.api.recall import router as recall_router
+
+
+app = FastAPI(title="NoMemory")
+
+app.include_router(ingest_router)
+app.include_router(query_router)
+app.include_router(recall_router)
+
+
+@app.get("/healthz")
+def healthz() -> dict[str, str]:
+    return {"status": "ok"}

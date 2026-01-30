@@ -75,4 +75,48 @@ Skills 的目标是“同一份事件数据，用不同策略生成不同的记�
 
 ## 状态
 
-该仓库目前以文档形式给出技术方案；可按版本逐步落地为实现与示例。
+该仓库提供 v0 技术方案文档，并包含一个可跑的 FastAPI + Postgres(pgvector) MVP 骨架（Ingest/Query/Recall）。
+
+## Quickstart（本地跑起来）
+
+0) 一键启动（推荐）
+
+```bash
+chmod +x ./scripts/dev-up.sh
+./scripts/dev-up.sh
+```
+
+默认端口为 `8001`（可用环境变量覆盖：`PORT=8000 ./scripts/dev-up.sh`）。
+
+1) 手动启动（可选）
+
+1.1) 启动数据库（Docker）
+
+```bash
+docker compose up -d db
+```
+
+1.2) 配置环境变量
+
+- 复制 `.env.example` 为 `.env` 并填写 `BIGMODEL_API_KEY`（若你要启用 embedding/LLM）
+
+1.3) 安装依赖并迁移（示例以 `uv` 为例）
+
+```bash
+uv sync
+uv run alembic upgrade head
+```
+
+1.4) 启动服务
+
+```bash
+uv run uvicorn app.main:app --reload
+```
+
+1.5) 写入消息（唯一写入接口）
+
+- `POST /v1/users/{user_id}/messages:batch`，带 `X-API-Key: $INGEST_API_KEY`
+
+1.6) 回忆
+
+- `POST /v1/recall`，带 `X-User-Id: <user_id>`

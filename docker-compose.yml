@@ -1,0 +1,21 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: nomemory-db
+    environment:
+      POSTGRES_DB: nomemory
+      POSTGRES_USER: nomemory
+      POSTGRES_PASSWORD: nomemory
+    ports:
+      - "5432:5432"
+    volumes:
+      - nomemory_pgdata:/var/lib/postgresql/data
+      - ./docker/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  nomemory_pgdata:

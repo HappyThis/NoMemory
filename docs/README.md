@@ -5,13 +5,17 @@
 ## 建议阅读顺序
 
 1. `README.md`：总览（理念 + 版本）
-2. `docs/query-api.md`：v0（chat）Query API
-3. `docs/recall-service.md`：v0（组件）检索服务（绑定 user_id 的工具装饰器）
-4. `docs/recall-agent-playbook.md`：v0（chat）回忆 Agent 技术方案
-5. `docs/retrieval-skill-creator.md`：v0（组件）creator skill 设计
+2. `docs/fastapi-tech-plan.md`：v0（工程）FastAPI 落地方案（含唯一写入接口）
+3. `docs/query-api.md`：v0（chat）Query API
+4. `docs/recall-service.md`：v0（组件）检索服务（绑定 user_id 的工具装饰器）
+5. `docs/recall-agent-playbook.md`：v0（chat）回忆 Agent 技术方案
+6. `docs/retrieval-skill-creator.md`：v0（组件）creator skill 设计
 
 ## 文档列表
 
+- `docs/fastapi-tech-plan.md`
+  - v0 工程落地方案：FastAPI + Postgres(pgvector)
+  - 包含唯一写入接口（Ingest API）与 Recall/Query 的读路径
 - `docs/query-api.md`
   - 消息查询接口：范围读取 / `lexical_search` / `semantic_search`
   - 上下文：`neighbors`
