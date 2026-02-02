@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timezone
+import logging
 from typing import Optional
 
 from sqlalchemy.dialects.postgresql import insert
@@ -11,6 +12,9 @@ from app.db.models import MessageEmbedding
 from app.db.session import SessionLocal
 from app.llm.bigmodel import BigModelClient, BigModelError
 from app.settings import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 def _chunk(items: list[str], size: int) -> Iterable[list[str]]:
@@ -50,7 +54,15 @@ def enqueue_embeddings_for_messages(
     texts = [m[2] for m in messages]
     embeddings: list[list[float]] = []
     for batch in _chunk(texts, 64):
-        embeddings.extend(bm.embeddings(inputs=batch, model=model))
+        try:
+            embeddings.extend(bm.embeddings(inputs=batch, model=model))
+        except BigModelError as e:
+            # Do not fail the request after the response has been sent; log and stop.
+            logger.warning("embeddings batch failed (%s): %s", type(e).__name__, str(e))
+            return
+        except Exception as e:
+            logger.warning("embeddings batch failed (%s)", type(e).__name__)
+            return
 
     rows = []
     if len(embeddings) != len(messages):

@@ -141,7 +141,7 @@ v0 推荐 B（便于异步回填、模型升级、重算）。
 
 鉴权：**仅可信调用方**（建议 API Key 或 mTLS；禁止终端用户/Agent 调用）。
 
-v0 开发态（本仓库实现）使用 `X-API-Key` 头做最小鉴权（见 `.env.example` 的 `INGEST_API_KEY`）。
+v0 开发态（本仓库实现）不内置鉴权；请在 API Gateway / Ingress 层做鉴权或仅在内网暴露。
 
 请求体（示意）：
 

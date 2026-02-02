@@ -115,7 +115,7 @@ uv run uvicorn app.main:app --reload
 
 1.5) 写入消息（唯一写入接口）
 
-- `POST /v1/users/{user_id}/messages:batch`，带 `X-API-Key: $INGEST_API_KEY`
+- `POST /v1/users/{user_id}/messages:batch`
 
 1.6) 回忆
 

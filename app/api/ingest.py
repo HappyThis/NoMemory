@@ -7,7 +7,6 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.api.schemas import IngestBatchRequest, IngestBatchResponse
-from app.auth.service import IngestAuthDep
 from app.db.models import Message
 from app.db.session import get_db
 from app.llm.embeddings import enqueue_embeddings_for_messages
@@ -16,7 +15,7 @@ from app.settings import settings
 router = APIRouter(prefix="/v1", tags=["ingest"])
 
 
-@router.post("/users/{user_id}/messages:batch", dependencies=[IngestAuthDep], response_model=IngestBatchResponse)
+@router.post("/users/{user_id}/messages:batch", response_model=IngestBatchResponse)
 def ingest_messages(
     user_id: str,
     req: IngestBatchRequest,
@@ -57,4 +56,3 @@ def ingest_messages(
     inserted_count = len(inserted)
     ignored_count = len(req.items) - inserted_count
     return IngestBatchResponse(inserted=inserted_count, ignored=ignored_count)
-
