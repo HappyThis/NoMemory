@@ -29,3 +29,8 @@
 ## 约定
 
 - **接口返回的是证据**（messages/events），而不是“记忆结论”。
+
+## Skills
+
+- 默认回忆/检索 skill：`skills/nomemory-recall-default/SKILL.md`
+- creator skill（生成其它回忆/检索 skill）：`skills/retrieval-skill-creator/SKILL.md`

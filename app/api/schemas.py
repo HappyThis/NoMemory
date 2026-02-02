@@ -81,15 +81,8 @@ class SemanticSearchResponse(BaseModel):
 class NeighborsResponse(BaseModel):
     items: list[ChatMessage]
 
-
-class RecallContext(BaseModel):
-    time_range: Optional[TimeRange] = None
-    role_pref: Optional[Literal["user", "any"]] = None
-
-
 class RecallRequest(BaseModel):
     question: str = Field(min_length=1)
-    context: Optional[RecallContext] = None
 
 
 class MemoryView(BaseModel):

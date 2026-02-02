@@ -11,6 +11,8 @@ class Settings(BaseSettings):
 
     # Auth for ingest endpoint (service-to-service). In production use a real secret.
     ingest_api_key: str = "dev-ingest-key"
+    recall_skill: str = "nomemory-recall-default"
+    recall_agent_config_path: str = "config/recall_agent.json"
 
     # LLM (agent reasoning) model selection
     llm_provider: str = "bigmodel"

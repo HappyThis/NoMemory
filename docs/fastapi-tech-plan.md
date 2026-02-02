@@ -66,6 +66,15 @@ postgresql+psycopg://nomemory:nomemory@127.0.0.1:5432/nomemory
 - `BIGMODEL_EMBEDDING_ENDPOINT=...`（按 BigModel 文档配置）
 - `BIGMODEL_EMBEDDING_MODEL=...`（按 BigModel 文档配置）
 
+## 1.4 Skills（creator + 默认检索 skill）
+
+本仓库提供两类 Skills（目录位于 `skills/`）：
+
+- `skills/retrieval-skill-creator/`：用于**生成**回忆/检索 skill（规范见 `docs/retrieval-skill-creator.md`）
+- `skills/nomemory-recall-default/`：默认的回忆/检索 skill（Recall Agent 运行时加载并遵循）
+
+Recall Agent 会加载 `RECALL_SKILL`（默认 `nomemory-recall-default`），并按 skill 的 Playbook 做 Observe → Reflect → Decide 的闭环检索。
+
 ## 1.3 迁移与启动（v0 最小可跑）
 
 v0 推荐用 Alembic 管理 schema：
