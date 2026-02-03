@@ -149,7 +149,6 @@ v0 开发态（本仓库实现）不内置鉴权；请在 API Gateway / Ingress 
 {
   "items": [
     {
-      "message_id": "m_...",
       "ts": "2026-01-26T10:47:00Z",
       "role": "user",
       "content": "我不吃辣",
@@ -161,7 +160,8 @@ v0 开发态（本仓库实现）不内置鉴权；请在 API Gateway / Ingress 
 
 行为约束：
 
-- **幂等**：基于 `UNIQUE(user_id, message_id)`；重复写入应返回 `ignored_count` 或按 upsert 策略覆盖（v0 推荐：默认忽略重复，避免误改历史）。
+- **message_id 生成**：v0 由服务端生成 `message_id`；响应会返回生成的 `message_ids`（与请求顺序一致）。
+- **幂等**：v0 不提供幂等写入（因为调用方不再提供 message_id）；如需幂等建议增加 `source_id`/`idempotency_key` 并建立唯一约束。
 - **强校验**：role 枚举、ts 格式、content 长度上限。
 - **写入后派生**：
   - FTS：如果用生成列则自动；否则写入时同步维护。
@@ -170,7 +170,7 @@ v0 开发态（本仓库实现）不内置鉴权；请在 API Gateway / Ingress 
 返回（示意）：
 
 ```json
-{ "inserted": 10, "ignored": 2, "failed": 0 }
+{ "inserted": 1, "ignored": 0, "failed": 0, "message_ids": ["<generated_message_id>"] }
 ```
 
 ### 3.2 Query API（读底座，按 `docs/query-api.md`）

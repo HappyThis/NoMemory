@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends
@@ -26,7 +27,7 @@ def ingest_messages(
     rows = [
         {
             "user_id": user_id,
-            "message_id": item.message_id,
+            "message_id": uuid.uuid4().hex,
             "ts": item.ts,
             "role": item.role,
             "content": item.content,
@@ -38,7 +39,6 @@ def ingest_messages(
     stmt = (
         insert(Message)
         .values(rows)
-        .on_conflict_do_nothing(index_elements=[Message.user_id, Message.message_id])
         .returning(Message.user_id, Message.message_id, Message.content)
     )
     inserted = db.execute(stmt).all()
@@ -54,5 +54,4 @@ def ingest_messages(
         )
 
     inserted_count = len(inserted)
-    ignored_count = len(req.items) - inserted_count
-    return IngestBatchResponse(inserted=inserted_count, ignored=ignored_count)
+    return IngestBatchResponse(inserted=inserted_count, ignored=0, message_ids=[r[1] for r in inserted])

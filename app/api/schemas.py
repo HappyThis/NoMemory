@@ -34,7 +34,6 @@ class PaginatedMessages(BaseModel):
 
 
 class IngestMessage(BaseModel):
-    message_id: str
     ts: datetime
     role: Role
     content: str
@@ -49,6 +48,7 @@ class IngestBatchResponse(BaseModel):
     inserted: int
     ignored: int
     failed: int = 0
+    message_ids: list[str] = Field(default_factory=list)
 
 
 class LexicalSearchRequest(BaseModel):

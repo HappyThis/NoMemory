@@ -117,6 +117,78 @@ uv run uvicorn app.main:app --reload
 
 - `POST /v1/users/{user_id}/messages:batch`
 
+调用示例：
+
+```bash
+curl -X POST "http://127.0.0.1:8001/v1/users/u_123/messages:batch" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [
+      {
+        "ts": "2026-02-02T08:00:00Z",
+        "role": "user",
+        "content": "我不吃辣",
+        "meta": { "conversation_id": "c_001" }
+      },
+      {
+        "ts": "2026-02-02T08:01:00Z",
+        "role": "assistant",
+        "content": "好的，我记住了",
+        "meta": { "conversation_id": "c_001" }
+      }
+    ]
+  }'
+```
+
+响应会返回服务端生成的 `message_ids`（与请求顺序一致）。
+
 1.6) 回忆
 
 - `POST /v1/recall`，带 `X-User-Id: <user_id>`
+
+调用示例：
+
+```bash
+curl -X POST "http://127.0.0.1:8001/v1/recall" \
+  -H "Content-Type: application/json" \
+  -H "X-User-Id: u_123" \
+  -d '{ "question": "我有哪些饮食偏好？" }'
+```
+
+1.7) 查询（Query API）
+
+- `GET /v1/users/{user_id}/messages`：范围读取（支持 `since/until/role/page_size/cursor`）
+- `POST /v1/messages/lexical_search`：关键词检索（FTS）
+- `POST /v1/messages/semantic_search`：语义检索（pgvector，若用 `query_text` 需配置 `BIGMODEL_API_KEY` 以生成 query embedding）
+- `GET /v1/users/{user_id}/messages/{message_id}/neighbors`：邻域上下文
+
+调用示例：
+
+```bash
+# 1) 范围读取
+curl "http://127.0.0.1:8001/v1/users/u_123/messages?page_size=20"
+
+# 2) 关键词检索（FTS）
+curl -X POST "http://127.0.0.1:8001/v1/messages/lexical_search" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "u_123",
+    "query_text": "\"不吃辣\"",
+    "filter": { "role": "user", "time_range": { "since": "2026-01-01T00:00:00Z" } },
+    "page_size": 20
+  }'
+
+# 3) 语义检索（需要 BIGMODEL_API_KEY，服务端会用 query_text 生成 embedding）
+curl -X POST "http://127.0.0.1:8001/v1/messages/semantic_search" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "u_123",
+    "query_text": "饮食偏好 忌口 不吃辣",
+    "filter": { "role": "user", "time_range": { "since": "2026-01-01T00:00:00Z" } },
+    "top_k": 10,
+    "min_score": 0.2
+  }'
+
+# 4) 邻域上下文（message_id 可从写入接口返回的 message_ids 中取得）
+curl "http://127.0.0.1:8001/v1/users/u_123/messages/<message_id>/neighbors?before=8&after=0"
+```
