@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.agent.recall_agent import RecallAgent
+from app.agent.errors import RecallAgentError
 from app.api.schemas import RecallRequest, RecallResponse
 from app.auth.user import get_user_id
 from app.db.session import get_db
@@ -23,6 +24,9 @@ def recall(req: RecallRequest, user_id: str = Depends(get_user_id), db: Session 
     agent = RecallAgent(db, user_id=user_id)
     try:
         return agent.run(question=req.question)
+    except RecallAgentError as e:
+        # Agent couldn't finish within its internal budgets/constraints.
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": e.code, "message": str(e)}) from e
     except BigModelError as e:
         code = getattr(e, "status_code", None)
         if code == 429:

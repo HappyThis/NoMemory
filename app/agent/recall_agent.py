@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,9 +10,9 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from app.log import get_logger
+from app.agent.errors import RecallAgentError
 from app.agent.contracts import (
     PlannerOutput,
-    SkillSelectionOutput,
     SynthesisOutput,
     example_json_for_prompt,
     schema_json_for_prompt,
@@ -25,12 +26,158 @@ from app.retrieval.messages import list_messages
 from app.retrieval.neighbors import get_neighbors
 from app.retrieval.semantic import semantic_search
 from app.settings import settings
-from app.skills.loader import SkillNotFoundError, load_skill, list_skill_metadata
+from app.skills.loader import SkillNotFoundError, load_skill
+from app.agent.tool_schemas import bigmodel_tool_schemas
 from app.utils.cursor import CursorError, decode_cursor, make_seek_cursor, parse_seek_anchor
 from app.utils.datetime import parse_datetime
 
 
 logger = get_logger(__name__)
+
+
+def _make_observation_safe(obs: dict[str, Any]) -> dict[str, Any]:
+    def _jsonable_item(item: dict[str, Any]) -> dict[str, Any]:
+        out = dict(item)
+        ts = out.get("ts")
+        if hasattr(ts, "isoformat"):
+            out["ts"] = ts.isoformat()
+        out.pop("user_id", None)
+        return out
+
+    safe: dict[str, Any] = {"tool": obs.get("tool")}
+    if "items" in obs:
+        safe["items"] = [_jsonable_item(x) for x in (obs.get("items") or [])]
+    if "anchors" in obs:
+        safe["anchors"] = obs.get("anchors")
+    if "next_cursor" in obs:
+        safe["next_cursor"] = obs.get("next_cursor")
+    if "applied_limits" in obs:
+        safe["applied_limits"] = obs.get("applied_limits")
+    return safe
+
+
+def _clip_text(text: str, max_len: int) -> str:
+    text = " ".join(str(text).split())
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "…"
+
+
+def _summarize_tool_args(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    if tool == "messages_list":
+        return {
+            "since": args.get("since"),
+            "until": args.get("until"),
+            "role": args.get("role"),
+            "page_size": args.get("page_size"),
+            "cursor_present": bool(args.get("cursor")),
+        }
+
+    if tool in ("lexical_search", "semantic_search"):
+        filt = args.get("filter") if isinstance(args.get("filter"), dict) else {}
+        tr = filt.get("time_range") if isinstance(filt, dict) else {}
+        base = {
+            "query_text": _clip_text(str(args.get("query_text") or ""), 120),
+            "time_range": {"since": (tr or {}).get("since"), "until": (tr or {}).get("until")},
+            "role": (filt or {}).get("role"),
+            "cursor_present": bool(args.get("cursor")),
+        }
+        if tool == "lexical_search":
+            base["page_size"] = args.get("page_size")
+        if tool == "semantic_search":
+            base["top_k"] = args.get("top_k")
+            base["min_score"] = args.get("min_score")
+        return base
+
+    if tool == "neighbors":
+        return {
+            "message_id": args.get("message_id"),
+            "before": args.get("before"),
+            "after": args.get("after"),
+        }
+
+    return {"args_keys": sorted([str(k) for k in (args or {}).keys()])}
+
+
+def _format_tool_call_human(tool: str, args: dict[str, Any]) -> str:
+    if tool == "messages_list":
+        return (
+            f"role={args.get('role')} since={args.get('since')} until={args.get('until')} "
+            f"page_size={args.get('page_size')} cursor={'yes' if args.get('cursor') else 'no'}"
+        )
+
+    if tool in ("lexical_search", "semantic_search"):
+        query_text = _clip_text(str(args.get("query_text") or ""), 160)
+        filt = args.get("filter") if isinstance(args.get("filter"), dict) else {}
+        tr = filt.get("time_range") if isinstance(filt, dict) else {}
+        since = (tr or {}).get("since")
+        until = (tr or {}).get("until")
+        role = (filt or {}).get("role")
+        if tool == "lexical_search":
+            return (
+                f"query={query_text!r} role={role} since={since} until={until} "
+                f"page_size={args.get('page_size')} cursor={'yes' if args.get('cursor') else 'no'}"
+            )
+        return f"query={query_text!r} role={role} since={since} until={until} top_k={args.get('top_k')} min_score={args.get('min_score')}"
+
+    if tool == "neighbors":
+        return f"message_id={args.get('message_id')} before={args.get('before')} after={args.get('after')}"
+
+    return f"args={_summarize_tool_args(tool, args)}"
+
+
+def _log_tool_observation(*, iteration: int, tool: str, safe_obs: dict[str, Any]) -> None:
+    items = safe_obs.get("items") or []
+    anchors = safe_obs.get("anchors") or []
+    next_cursor = safe_obs.get("next_cursor")
+    applied = safe_obs.get("applied_limits") or {}
+
+    role = None
+    since = None
+    until = None
+    if isinstance(applied, dict):
+        role = applied.get("role")
+        tr = applied.get("time_range") or {}
+        if isinstance(tr, dict):
+            since = tr.get("since")
+            until = tr.get("until")
+
+    logger.info(
+        "recall.obs iter=%s tool=%s items=%s anchors=%s next_cursor=%s role=%s since=%s until=%s",
+        iteration,
+        tool,
+        len(items) if isinstance(items, list) else 0,
+        len(anchors) if isinstance(anchors, list) else 0,
+        bool(next_cursor),
+        role,
+        since,
+        until,
+    )
+
+    if isinstance(anchors, list):
+        for idx, a in enumerate(anchors[:3], start=1):
+            if isinstance(a, (list, tuple)) and len(a) >= 2:
+                logger.info("recall.obs_anchor iter=%s idx=%s message_id=%s why=%s", iteration, idx, a[0], a[1])
+
+    if isinstance(items, list):
+        for idx, it in enumerate(items[:3], start=1):
+            if not isinstance(it, dict):
+                continue
+            logger.info(
+                "recall.obs_item iter=%s idx=%s ts=%s role=%s id=%s content=%s",
+                iteration,
+                idx,
+                it.get("ts"),
+                it.get("role"),
+                it.get("message_id"),
+                _clip_text(str(it.get("content") or ""), 200),
+            )
+
+
+def _bigmodel_tool_schemas(allowed_tools: list[str]) -> list[dict[str, Any]]:
+    return bigmodel_tool_schemas(allowed_tools=allowed_tools)
 
 
 @dataclass(frozen=True)
@@ -127,18 +274,57 @@ class RecallAgent:
         *,
         question: str,
     ) -> RecallResponse:
+        # Skill selection is configuration-driven (no LLM selection).
+        skill_id = self.pinned_skill_id or settings.recall_skill
+        logger.info(
+            "recall.start user_id=%s skill_id=%s question_len=%s model=%s max_iterations=%s",
+            self.user_id,
+            skill_id,
+            len(question or ""),
+            settings.llm_model,
+            self.defaults.max_iterations,
+        )
         client = get_chat_client()
-        conversation, skill_id = self._select_skill_conversation(client=client, question=question)
         try:
+            t1 = time.monotonic()
             self.skill = load_skill(skill_id)
+            logger.debug("recall.skill_load done skill_id=%s elapsed_ms=%s", skill_id, int((time.monotonic() - t1) * 1000))
         except SkillNotFoundError as e:
             raise e
 
-        # Progressive loading: only after selecting a skill do we load its SKILL.md into context.
-        conversation.append(BigModelMessage(role="system", content=self.skill.text))
+        tool_rules = (
+            "你是一个记忆检索工具编排 Agent。你已经加载了当前任务的 skill。\n"
+            "接下来你要做的是：反复选择合适的工具进行检索，直到你认为证据已足够。\n"
+            "工具调用必须使用 tool_calls（函数调用）方式；工具结果会以 role=tool 的消息追加到对话里。\n"
+            "硬性要求：messages_list/lexical_search/semantic_search 必须显式提供 time_range 与 role（role 可为 any）。\n"
+            "建议：每次最多调用 1 个工具；尽量先收窄再扩展；找到锚点后优先 neighbors 补上下文。\n"
+            "当你不再需要调用工具时：不要再发起 tool_calls，改为输出简短文本（例如 DONE）。\n"
+        )
+
+        # Rebuild a clean planning conversation:
+        # skill + tool rules are provided once; then the user task; then iterative tool results.
+        conversation = [
+            BigModelMessage(role="system", content=self.skill.text),
+            BigModelMessage(role="system", content=tool_rules),
+            BigModelMessage(role="user", content=f"TASK_QUERY:\n{question}"),
+        ]
+
+        logger.debug(
+            "recall.context initialized messages=%s skill_chars=%s",
+            len(conversation),
+            len(self.skill.text or ""),
+        )
 
         evidence_msgs, final_limits = self._run_llm_loop(client=client, conversation=conversation)
+
         memory_view = self._synthesize(client=client, conversation=conversation)
+        logger.info(
+            "recall.done evidence=%s preferences=%s profile=%s constraints=%s",
+            len(evidence_msgs),
+            len(memory_view.preferences),
+            len(memory_view.profile),
+            len(memory_view.constraints),
+        )
 
         return RecallResponse(
             memory_view=memory_view,
@@ -152,73 +338,12 @@ class RecallAgent:
             ),
         )
 
-    # --- Skill-driven (LLM) loop ---
-
-    def _select_skill_conversation(self, *, client: Any, question: str) -> tuple[list[BigModelMessage], str]:
-        skills = list_skill_metadata()
-        skill_rows = [{"id": s.skill_id, "name": s.name, "description": s.description} for s in skills]
-        skill_ids = {s.skill_id for s in skills}
-
-        intro = (
-            "你是一个记忆检索与合成 Agent。\n"
-            "你将看到可用的 skill 列表（仅包含名称/描述），以及用户的任务（query）。\n"
-            "你必须先选择一个最合适的 skill，然后再按该 skill 的规则完成检索与 memory_view 合成。\n"
-            "注意：工具调用与合成输出都必须严格输出 JSON（不输出额外文本）。\n"
-            "可用工具（全局）：messages_list / lexical_search / semantic_search / neighbors。\n"
-            f"SKILLS:{json.dumps(skill_rows, ensure_ascii=False)}"
-        )
-
-        conversation: list[BigModelMessage] = [
-            BigModelMessage(role="system", content=intro),
-            BigModelMessage(role="user", content=f"TASK_QUERY:\n{question}"),
-        ]
-
-        if self.pinned_skill_id:
-            if self.pinned_skill_id not in skill_ids:
-                raise SkillNotFoundError(f"Skill not found: {self.pinned_skill_id}")
-            selection = SkillSelectionOutput(skill_id=self.pinned_skill_id)
-            conversation.append(BigModelMessage(role="assistant", content=selection.model_dump_json(ensure_ascii=False)))
-            logger.info("recall.skill pinned skill_id=%s", selection.skill_id)
-            return (conversation, selection.skill_id)
-
-        prompt = (
-            "请选择一个 skill 来完成该任务。\n"
-            "只输出一个 JSON 对象，必须匹配以下 schema。\n"
-            f"SCHEMA:{schema_json_for_prompt(SkillSelectionOutput)}\n"
-            f"EXAMPLE:{example_json_for_prompt(SkillSelectionOutput)}"
-        )
-
-        last_err: Optional[Exception] = None
-        selected: SkillSelectionOutput | None = None
-        for attempt in range(1, 4):
-            try:
-                selected = SkillSelectionOutput.model_validate(
-                    client.chat_json(
-                        model=settings.llm_model,
-                        messages=conversation + [BigModelMessage(role="user", content=prompt)],
-                        temperature=0.2,
-                    )
-                )
-                if selected.skill_id not in skill_ids:
-                    raise SkillNotFoundError(f"Skill not found: {selected.skill_id}")
-                conversation.append(BigModelMessage(role="assistant", content=selected.model_dump_json(ensure_ascii=False)))
-                logger.info("recall.skill selected skill_id=%s", selected.skill_id)
-                return (conversation, selected.skill_id)
-            except Exception as e:
-                last_err = e
-                logger.warning("recall.skill_select attempt=%s/3 failed (%s)", attempt, type(e).__name__)
-                continue
-        logger.exception("recall.skill_select failed after 3 attempts")
-        raise last_err or RuntimeError("Failed to select a skill")
-
     def _run_llm_loop(
         self,
         *,
         client: Any,
         conversation: list[BigModelMessage],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        max_structured_retries = 3
-
         evidence: list[dict[str, Any]] = []
         anchors: list[tuple[str, str]] = []  # (message_id, why)
 
@@ -229,91 +354,121 @@ class RecallAgent:
         current_role: Optional[str] = None
 
         for i in range(self.defaults.max_iterations):
-            logger.info(
-                "recall.loop iteration=%s/%s evidence=%s",
-                i + 1,
-                self.defaults.max_iterations,
-                len(evidence),
+            iteration = i + 1
+            remaining = self.defaults.max_iterations - iteration
+            logger.info("recall.iter iter=%s/%s remaining=%s evidence=%s", iteration, self.defaults.max_iterations, remaining, len(evidence))
+            logger.debug(
+                "recall.loop state since=%s until=%s role=%s conversation_msgs=%s",
+                current_since.isoformat() if current_since else None,
+                current_until.isoformat() if current_until else None,
+                current_role or "any",
+                len(conversation),
             )
 
-            plan_prompt = (
-                "请规划下一步检索工具调用（或 stop=true 结束检索）。严格遵守当前已加载的 skill。\n"
-                "你将看到历史对话中追加的 OBSERVATION_JSON（工具调用结果），请据此决定下一步。\n"
-                f"迭代预算：当前 {i + 1}/{self.defaults.max_iterations}（最多 {self.defaults.max_iterations}）。\n"
-                f"允许工具：{json.dumps(self.defaults.allowed_tools, ensure_ascii=False)}\n"
-                "硬性要求：messages_list/lexical_search/semantic_search 必须显式提供 time_range 与 role（role 可为 any）。\n"
-                "只输出一个 JSON 对象，必须匹配以下 schema。\n"
-                f"SCHEMA:{schema_json_for_prompt(PlannerOutput)}\n"
-                f"EXAMPLE:{example_json_for_prompt(PlannerOutput)}\n"
+            t0 = time.monotonic()
+            msg = client.chat_message(
+                model=settings.llm_model,
+                messages=conversation,
+                temperature=0.2,
+                tools=_bigmodel_tool_schemas(self.defaults.allowed_tools),
+                tool_choice="auto",
             )
-            last_err: Optional[Exception] = None
-            plan_obj: PlannerOutput | None = None
-            for attempt in range(1, max_structured_retries + 1):
+            content = msg.get("content")
+            if isinstance(content, str) and content:
+                logger.info("recall.think iter=%s content=%s", iteration, _clip_text(content, 500))
+            reasoning = msg.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                logger.info("recall.think iter=%s reasoning=%s", iteration, _clip_text(reasoning, 1500))
+            tool_calls = msg.get("tool_calls") or []
+            if not isinstance(tool_calls, list):
+                tool_calls = []
+
+            # Persist the assistant tool_calls message in the conversation so tool_call_id references remain valid.
+            conversation.append(
+                BigModelMessage(
+                    role="assistant",
+                    content=msg.get("content"),
+                    tool_calls=tool_calls or None,
+                )
+            )
+
+            if not tool_calls:
+                logger.info("recall.stop iter=%s reason=no_tool_calls", iteration)
+                break
+
+            # Execute each tool call and feed results back as role=tool messages.
+            stop_loop = False
+            for j, tc in enumerate(tool_calls):
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = str(tc.get("id") or f"call-{i+1}-{j+1}")
+                fn = tc.get("function") or {}
+                if not isinstance(fn, dict):
+                    continue
+                tool = str(fn.get("name") or "").strip()
+                arg_text = fn.get("arguments")
+                if not isinstance(arg_text, str):
+                    arg_text = "{}"
                 try:
-                    plan_obj = PlannerOutput.model_validate(
-                        client.chat_json(
-                            model=settings.llm_model,
-                            messages=conversation + [BigModelMessage(role="user", content=plan_prompt)],
-                            temperature=0.2,
-                        )
+                    args = json.loads(arg_text) if arg_text.strip() else {}
+                except Exception:
+                    args = {}
+
+                if tool not in set(self.defaults.allowed_tools):
+                    logger.warning("recall.tool_call tool_not_allowed tool=%s", tool)
+                    raise ValueError(f"Tool not allowed: {tool}")
+
+                logger.info("recall.act iter=%s tool=%s tool_call_id=%s %s", iteration, tool, tc_id, _format_tool_call_human(tool, args))
+                t1 = time.monotonic()
+                obs = self._execute_tool(tool=tool, args=args)
+                logger.debug("recall.tool_result applied_limits=%s", obs.get("applied_limits"))
+                safe_obs = _make_observation_safe(obs)
+                logger.debug("recall.tool_exec_elapsed iter=%s tool=%s elapsed_ms=%s", iteration, tool, int((time.monotonic() - t1) * 1000))
+                _log_tool_observation(iteration=iteration, tool=tool, safe_obs=safe_obs)
+                conversation.append(
+                    BigModelMessage(
+                        role="tool",
+                        tool_call_id=tc_id,
+                        content=json.dumps(safe_obs, ensure_ascii=False),
                     )
-                    last_err = None
+                )
+
+                # Update anchors/evidence.
+                prev_evidence = len(evidence)
+                for item in obs.get("items") or []:
+                    if item.get("role") == "system":
+                        continue
+                    key = (item["user_id"], item["message_id"])
+                    if any((e["user_id"], e["message_id"]) == key for e in evidence):
+                        continue
+                    evidence.append(item)
+                if len(evidence) != prev_evidence:
+                    logger.debug("recall.evidence added=%s total=%s", len(evidence) - prev_evidence, len(evidence))
+
+                if obs.get("anchors"):
+                    anchors.extend(obs["anchors"])
+
+                applied = obs.get("applied_limits") or {}
+                if isinstance(applied, dict):
+                    tr = applied.get("time_range") or {}
+                    if isinstance(tr, dict):
+                        current_since = parse_datetime(tr.get("since")) or current_since
+                        current_until = parse_datetime(tr.get("until")) or current_until
+                    role_val = applied.get("role")
+                    current_role = None if role_val in (None, "any") else ("user" if role_val == "user" else current_role)
+
+                if len(evidence) >= self.defaults.max_evidence:
+                    logger.info("recall.stop iter=%s reason=evidence_cap cap=%s", iteration, self.defaults.max_evidence)
+                    stop_loop = True
                     break
-                except Exception as e:
-                    last_err = e
-                    plan_obj = None
-                    logger.warning(
-                        "recall.planner attempt=%s/%s failed (%s)",
-                        attempt,
-                        max_structured_retries,
-                        type(e).__name__,
-                    )
-                    continue
-            if last_err is not None or plan_obj is None:
-                logger.exception("recall.planner failed after %s attempts", max_structured_retries)
-                raise last_err or RuntimeError("Failed to obtain valid planner output")
-            conversation.append(BigModelMessage(role="assistant", content=plan_obj.model_dump_json(ensure_ascii=False)))
-            if plan_obj.stop is True:
-                logger.info("recall.planner stop=true")
+            if stop_loop:
                 break
-
-            tool = str(plan_obj.tool or "")
-            args = plan_obj.args or {}
-            if tool not in set(self.defaults.allowed_tools):
-                logger.warning("recall.planner tool_not_allowed tool=%s", tool)
-                raise ValueError(f"Tool not allowed: {tool}")
-            logger.debug("recall.planner tool=%s args_keys=%s", tool, sorted([str(k) for k in args.keys()]))
-
-            obs = self._execute_tool(
-                tool=tool,
-                args=args,
+        else:
+            logger.error("recall.loop max_iterations_exceeded max_iterations=%s", self.defaults.max_iterations)
+            raise RecallAgentError(
+                "Recall planner exceeded max_iterations without stop=true",
+                code="max_iterations_exceeded",
             )
-            conversation.append(BigModelMessage(role="user", content=self._format_observation(obs)))
-
-            # Update anchors/evidence.
-            for item in obs.get("items") or []:
-                if item.get("role") == "system":
-                    continue
-                key = (item["user_id"], item["message_id"])
-                if any((e["user_id"], e["message_id"]) == key for e in evidence):
-                    continue
-                evidence.append(item)
-
-            if obs.get("anchors"):
-                anchors.extend(obs["anchors"])
-
-            applied = obs.get("applied_limits") or {}
-            if isinstance(applied, dict):
-                tr = applied.get("time_range") or {}
-                if isinstance(tr, dict):
-                    current_since = parse_datetime(tr.get("since")) or current_since
-                    current_until = parse_datetime(tr.get("until")) or current_until
-                role_val = applied.get("role")
-                current_role = None if role_val in (None, "any") else ("user" if role_val == "user" else current_role)
-
-            if len(evidence) >= self.defaults.max_evidence:
-                logger.info("recall.loop evidence_cap_reached cap=%s", self.defaults.max_evidence)
-                break
 
         final_limits = {
             "time_range": {
@@ -325,24 +480,7 @@ class RecallAgent:
         return (evidence[: self.defaults.max_evidence], final_limits)
 
     def _format_observation(self, obs: dict[str, Any]) -> str:
-        def _jsonable_item(item: dict[str, Any]) -> dict[str, Any]:
-            out = dict(item)
-            ts = out.get("ts")
-            if hasattr(ts, "isoformat"):
-                out["ts"] = ts.isoformat()
-            out.pop("user_id", None)
-            return out
-
-        safe: dict[str, Any] = {"tool": obs.get("tool")}
-        if "items" in obs:
-            safe["items"] = [_jsonable_item(x) for x in (obs.get("items") or [])]
-        if "anchors" in obs:
-            safe["anchors"] = obs.get("anchors")
-        if "next_cursor" in obs:
-            safe["next_cursor"] = obs.get("next_cursor")
-        if "applied_limits" in obs:
-            safe["applied_limits"] = obs.get("applied_limits")
-        return "OBSERVATION_JSON:\n" + json.dumps(safe, ensure_ascii=False)
+        return "OBSERVATION_JSON:\n" + json.dumps(_make_observation_safe(obs), ensure_ascii=False)
 
     def _execute_tool(
         self,
@@ -350,6 +488,7 @@ class RecallAgent:
         tool: str,
         args: dict[str, Any],
     ) -> dict[str, Any]:
+        logger.debug("recall.tool_exec tool=%s args=%s", tool, _summarize_tool_args(tool, args))
         # Enforce user binding. The model must explicitly provide filters (no default fallbacks).
         if tool == "messages_list":
             if "since" not in args and "until" not in args:
@@ -384,6 +523,13 @@ class RecallAgent:
                 anchor=anchor,
             )
             out_items = [_msg_to_dict(m) for m in items]
+            if out_items:
+                logger.debug(
+                    "recall.messages_list result_count=%s first_ts=%s last_ts=%s",
+                    len(out_items),
+                    out_items[0].get("ts"),
+                    out_items[-1].get("ts"),
+                )
             next_cursor = None
             if items:
                 last = items[-1]
@@ -438,6 +584,7 @@ class RecallAgent:
                 page_size=min(page_size, self.defaults.max_page_size),
                 anchor=anchor,
             )
+            logger.debug("recall.lexical_search rows=%s", len(rows))
             items = [_msg_to_dict(m) for (m, _rank) in rows]
             anchors = [(m.message_id, "lexical_top") for (m, _rank) in rows[:3]]
             next_cursor = None
@@ -481,7 +628,8 @@ class RecallAgent:
             model = self.defaults.embedding_model
             try:
                 qemb = embed_query_text(query_text or self.defaults.fallback_query_text, provider=provider, model=model)
-            except Exception:
+            except Exception as e:
+                logger.warning("recall.semantic embed_failed (%s): %s", type(e).__name__, str(e))
                 applied_limits = {
                     "time_range": {"since": since_dt.isoformat() if since_dt else None, "until": until_dt.isoformat() if until_dt else None},
                     "role": role_val or "any",
@@ -500,6 +648,7 @@ class RecallAgent:
                 provider=provider,
                 model=model,
             )
+            logger.debug("recall.semantic_search rows=%s provider=%s model=%s", len(rows), provider, model)
             items = [_msg_to_dict(m) for (m, _score) in rows]
             anchors = [(m.message_id, "semantic_top") for (m, _score) in rows[:3]]
             applied_limits = {
@@ -519,6 +668,7 @@ class RecallAgent:
                 before=min(before, self.defaults.max_neighbors),
                 after=min(after, self.defaults.max_neighbors),
             )
+            logger.debug("recall.neighbors items=%s message_id=%s", len(items), message_id)
             applied_limits = {
                 "time_range": {"since": None, "until": None},
                 "role": "any",
@@ -533,7 +683,7 @@ class RecallAgent:
         max_structured_retries = 3
 
         synth_prompt = (
-            "现在请基于历史对话中的 OBSERVATION_JSON（工具调用结果）合成 memory_view。\n"
+            "现在请基于历史对话中的工具调用结果（role=tool 的 JSON 内容）合成 memory_view。\n"
             "只允许输出被证据支持的条目；证据不足则对应数组保持为空。\n"
             "只输出一个 JSON 对象，必须匹配以下 schema。\n"
             f"SCHEMA:{schema_json_for_prompt(SynthesisOutput)}\n"
@@ -543,6 +693,7 @@ class RecallAgent:
         out: SynthesisOutput | None = None
         for attempt in range(1, max_structured_retries + 1):
             try:
+                t0 = time.monotonic()
                 out = SynthesisOutput.model_validate(
                     client.chat_json(
                         model=settings.llm_model,
@@ -551,15 +702,17 @@ class RecallAgent:
                     )
                 )
                 last_err = None
+                logger.debug("recall.synthesis attempt=%s/%s ok elapsed_ms=%s", attempt, max_structured_retries, int((time.monotonic() - t0) * 1000))
                 break
             except Exception as e:
                 last_err = e
                 out = None
                 logger.warning(
-                    "recall.synthesis attempt=%s/%s failed (%s)",
+                    "recall.synthesis attempt=%s/%s failed (%s): %s",
                     attempt,
                     max_structured_retries,
                     type(e).__name__,
+                    str(e),
                 )
                 continue
         if last_err is not None or out is None:

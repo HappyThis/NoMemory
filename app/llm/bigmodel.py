@@ -10,13 +10,25 @@ from app.settings import settings
 
 
 class BigModelError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response_text: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_text = response_text
 
 
 @dataclass(frozen=True)
 class BigModelMessage:
     role: str
-    content: str
+    content: str | None = None
+    # Function-calling (tools) support
+    tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class BigModelClient:
@@ -27,6 +39,19 @@ class BigModelClient:
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
+
+    def _messages_payload(self, messages: list[BigModelMessage]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for m in messages:
+            d: dict[str, Any] = {"role": m.role}
+            # Some messages (e.g. assistant tool_calls) may omit content. Keep the field present as a string.
+            d["content"] = m.content if m.content is not None else ""
+            if m.tool_call_id is not None:
+                d["tool_call_id"] = m.tool_call_id
+            if m.tool_calls is not None:
+                d["tool_calls"] = m.tool_calls
+            out.append(d)
+        return out
 
     def embeddings(self, *, inputs: list[str], model: str, dimensions: Optional[int] = None) -> list[list[float]]:
         payload: dict[str, Any] = {"model": model, "input": inputs}
@@ -52,13 +77,17 @@ class BigModelClient:
         with httpx.Client(timeout=60.0) as client:
             r = client.post(settings.bigmodel_chat_endpoint, headers=self._headers(), json=payload)
             if r.status_code >= 400:
-                raise BigModelError(f"Chat API error: {r.status_code} {r.text}")
+                raise BigModelError(
+                    f"Chat API error: {r.status_code} {r.text}",
+                    status_code=r.status_code,
+                    response_text=r.text,
+                )
             return r.json()
 
     def chat(self, *, messages: list[BigModelMessage], model: str, temperature: float = 0.2) -> str:
         payload = {
             "model": model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": self._messages_payload(messages),
             "temperature": temperature,
             "stream": False,
         }
@@ -72,6 +101,39 @@ class BigModelClient:
             raise BigModelError("Invalid chat response content")
         return content
 
+    def chat_message(
+        self,
+        *,
+        messages: list[BigModelMessage],
+        model: str,
+        temperature: float = 0.2,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = "auto",
+    ) -> dict[str, Any]:
+        """
+        Chat that returns the raw assistant message object (supports tool_calls).
+
+        BigModel tool-calling docs show the response message may contain `tool_calls`, and tool results should be sent
+        back as messages with `role="tool"` and `tool_call_id`.
+        """
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": self._messages_payload(messages),
+            "temperature": temperature,
+            "stream": False,
+        }
+        if tools is not None:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice
+        data = self._chat_raw(payload=payload)
+        choices = data.get("choices") or []
+        if not choices:
+            raise BigModelError("No choices in chat response")
+        msg = choices[0].get("message")
+        if not isinstance(msg, dict):
+            raise BigModelError("Invalid chat response message")
+        return msg
+
     def chat_json(self, *, messages: list[BigModelMessage], model: str, temperature: float = 0.2) -> dict[str, Any]:
         """
         Official structured output mode (JSON object).
@@ -80,7 +142,7 @@ class BigModelClient:
         """
         payload = {
             "model": model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": self._messages_payload(messages),
             "temperature": temperature,
             "stream": False,
             "response_format": {"type": "json_object"},
