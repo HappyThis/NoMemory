@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timezone
-import logging
 from typing import Optional
 
 from sqlalchemy.dialects.postgresql import insert
@@ -10,11 +9,12 @@ from sqlalchemy.orm import Session
 
 from app.db.models import MessageEmbedding
 from app.db.session import SessionLocal
+from app.log import get_logger
 from app.llm.bigmodel import BigModelClient, BigModelError
 from app.settings import settings
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _chunk(items: list[str], size: int) -> Iterable[list[str]]:

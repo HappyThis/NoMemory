@@ -6,6 +6,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    log_level: str = "INFO"
+    log_format: str = "json"  # json/text
+
     database_url: str = "postgresql+psycopg://nomemory:nomemory@127.0.0.1:5432/nomemory"
     cursor_secret: str = "dev-insecure"
 

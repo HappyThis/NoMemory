@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +8,7 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
+from app.log import get_logger
 from app.agent.contracts import (
     PlannerOutput,
     SkillSelectionOutput,
@@ -30,7 +30,7 @@ from app.utils.cursor import CursorError, decode_cursor, make_seek_cursor, parse
 from app.utils.datetime import parse_datetime
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
