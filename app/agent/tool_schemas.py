@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TimeRange(BaseModel):
-    since: str | None = Field(default=None, description="ISO8601 datetime or null")
-    until: str | None = Field(default=None, description="ISO8601 datetime or null")
+    since: datetime | None = Field(default=None, description="ISO8601 datetime or null")
+    until: datetime | None = Field(default=None, description="ISO8601 datetime or null")
+
+    @model_validator(mode="after")
+    def _require_one_bound(self) -> "TimeRange":
+        if self.since is None and self.until is None:
+            raise ValueError("time_range requires at least one of since/until")
+        return self
 
 
 class Filter(BaseModel):
@@ -16,11 +23,17 @@ class Filter(BaseModel):
 
 
 class MessagesListArgs(BaseModel):
-    since: str | None = None
-    until: str | None = None
+    since: datetime | None = None
+    until: datetime | None = None
     role: Literal["user", "any"]
     page_size: int | None = None
     cursor: str | None = None
+
+    @model_validator(mode="after")
+    def _require_one_bound(self) -> "MessagesListArgs":
+        if self.since is None and self.until is None:
+            raise ValueError("messages_list requires at least one of since/until")
+        return self
 
 
 class LexicalSearchArgs(BaseModel):
@@ -130,4 +143,3 @@ def bigmodel_tool_schemas(*, allowed_tools: list[str]) -> list[dict[str, Any]]:
         if s:
             out.append(s)
     return out
-

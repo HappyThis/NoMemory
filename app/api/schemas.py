@@ -85,19 +85,8 @@ class RecallRequest(BaseModel):
     question: str = Field(min_length=1)
 
 
-class MemoryView(BaseModel):
-    preferences: list[str] = Field(default_factory=list)
-    profile: list[str] = Field(default_factory=list)
-    constraints: list[str] = Field(default_factory=list)
-
-
-class RecallLimits(BaseModel):
-    time_range: TimeRange
-    role: str
-    messages_considered: str = "unknown"
-
-
 class RecallResponse(BaseModel):
-    memory_view: MemoryView
-    evidence: list[ChatMessage]
-    limits: RecallLimits
+    # A single third-person memory summary derived from evidence (no categories).
+    memory_view: str = Field(default="")
+    # Evidence messages supporting the summary.
+    evidence: list[ChatMessage] = Field(default_factory=list)

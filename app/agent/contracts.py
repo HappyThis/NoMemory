@@ -48,19 +48,14 @@ class SynthesisOutput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    preferences: list[str] = Field(
-        default_factory=list,
-        description="可被证据支持的偏好（preferences）条目列表。",
-        examples=[[]],
+    memory_view: str = Field(
+        default="",
+        description="基于证据的第三人称记忆描述（单段文本）。不得编造无证据事实。",
+        examples=["该用户曾提及多次不喜欢吃辣。"],
     )
-    profile: list[str] = Field(
+    evidence_message_ids: list[str] = Field(
         default_factory=list,
-        description="可被证据支持的个人背景/画像（profile）条目列表。",
-        examples=[[]],
-    )
-    constraints: list[str] = Field(
-        default_factory=list,
-        description="可被证据支持的约束/限制（constraints）条目列表。",
+        description="本次回忆用于支撑结论的证据 message_id 列表（按重要性排序）。",
         examples=[[]],
     )
 
@@ -97,7 +92,7 @@ def example_json_for_prompt(model: type[BaseModel]) -> str:
         return ex.model_dump_json(ensure_ascii=False)
     if model is SynthesisOutput:
         # Use an "empty lists" example to avoid biasing the model into hallucinating specific facts.
-        ex = SynthesisOutput(preferences=[], profile=[], constraints=[])
+        ex = SynthesisOutput(memory_view="", evidence_message_ids=[])
         return ex.model_dump_json(ensure_ascii=False)
     if model is SkillSelectionOutput:
         ex = SkillSelectionOutput(skill_id="nomemory-recall-default")

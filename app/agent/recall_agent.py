@@ -3,21 +3,17 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Optional
 
+from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.log import get_logger
 from app.agent.errors import RecallAgentError
-from app.agent.contracts import (
-    PlannerOutput,
-    SynthesisOutput,
-    example_json_for_prompt,
-    schema_json_for_prompt,
-)
-from app.api.schemas import MemoryView, RecallLimits, RecallResponse, TimeRange
+from app.agent.contracts import SynthesisOutput, example_json_for_prompt
+from app.api.schemas import ChatMessage, RecallResponse
 from app.llm.bigmodel import BigModelMessage
 from app.llm.embeddings import embed_query_text
 from app.llm.factory import get_chat_client
@@ -27,9 +23,16 @@ from app.retrieval.neighbors import get_neighbors
 from app.retrieval.semantic import semantic_search
 from app.settings import settings
 from app.skills.loader import SkillNotFoundError, load_skill
-from app.agent.tool_schemas import bigmodel_tool_schemas
+from app.agent.tool_schemas import (
+    LexicalSearchArgs,
+    MessagesListArgs,
+    NeighborsArgs,
+    SemanticSearchArgs,
+    bigmodel_tool_schemas,
+)
 from app.utils.cursor import CursorError, decode_cursor, make_seek_cursor, parse_seek_anchor
 from app.utils.datetime import parse_datetime
+from app.db.models import Message
 
 
 logger = get_logger(__name__)
@@ -53,7 +56,35 @@ def _make_observation_safe(obs: dict[str, Any]) -> dict[str, Any]:
         safe["next_cursor"] = obs.get("next_cursor")
     if "applied_limits" in obs:
         safe["applied_limits"] = obs.get("applied_limits")
+    if "error" in obs:
+        safe["error"] = obs.get("error")
+    for k in (
+        "total_items",
+        "returned_items",
+        "truncated",
+        "truncate_reason",
+        "truncate_policy",
+        "max_tool_items",
+        "sort",
+    ):
+        if k in obs:
+            safe[k] = obs.get(k)
     return safe
+
+
+_TOOL_ARG_MODELS: dict[str, Any] = {
+    "messages_list": MessagesListArgs,
+    "lexical_search": LexicalSearchArgs,
+    "semantic_search": SemanticSearchArgs,
+    "neighbors": NeighborsArgs,
+}
+
+
+def _validate_tool_args(*, tool: str, args: dict[str, Any]) -> Any:
+    model = _TOOL_ARG_MODELS.get(tool)
+    if model is None:
+        raise ValueError(f"No args schema for tool: {tool}")
+    return model.model_validate(args)
 
 
 def _clip_text(text: str, max_len: int) -> str:
@@ -63,6 +94,139 @@ def _clip_text(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len] + "…"
+
+
+def _extract_first_json_object(text: str) -> dict[str, Any]:
+    """
+    Extract the first JSON object from an LLM text response.
+
+    Tolerates:
+    - ```json ... ``` code fences
+    - Leading/trailing commentary around the JSON
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Empty content")
+
+    s = text.strip()
+    if s.startswith("```"):
+        first_nl = s.find("\n")
+        if first_nl != -1:
+            s = s[first_nl + 1 :]
+        if s.endswith("```"):
+            s = s[: -3]
+        s = s.strip()
+
+    # Fast path: content is a single JSON object.
+    try:
+        v = json.loads(s)
+        if isinstance(v, dict):
+            return v
+    except Exception:
+        pass
+
+    start = s.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found")
+
+    in_string = False
+    escape = False
+    depth = 0
+    end: int | None = None
+    for i in range(start, len(s)):
+        ch = s[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end is None:
+        raise ValueError("Unclosed JSON object")
+
+    candidate = s[start:end].strip()
+    v2 = json.loads(candidate)
+    if not isinstance(v2, dict):
+        raise ValueError("Expected JSON object")
+    return v2
+
+
+def _apply_tool_item_budget(obs: dict[str, Any], *, max_tool_items: int) -> dict[str, Any]:
+    """
+    Hard constraint: prevent context explosion by truncating tool-returned `items` after the tool runs.
+
+    - Do NOT clamp tool-call input params (we assume tool performance is OK).
+    - When truncating, sort by ts desc (latest first) then message_id desc.
+    - Report total/returned counts and truncation reason back to the model via role=tool JSON.
+    """
+    items = obs.get("items")
+    if not isinstance(items, list):
+        obs["total_items"] = 0
+        obs["returned_items"] = 0
+        obs["truncated"] = False
+        obs["max_tool_items"] = max_tool_items
+        return obs
+
+    total = len(items)
+    obs["total_items"] = total
+    obs["max_tool_items"] = max_tool_items
+
+    if max_tool_items is None or int(max_tool_items) <= 0:
+        obs["items"] = []
+        obs["returned_items"] = 0
+        obs["truncated"] = total > 0
+        obs["truncate_reason"] = "max_tool_items_non_positive" if total > 0 else None
+        obs["truncate_policy"] = "sort_by_ts_desc_message_id_desc_then_take_first"
+        obs["sort"] = "ts_desc_message_id_desc"
+        obs["next_cursor"] = None
+        obs["anchors"] = []
+        return obs
+
+    max_tool_items = int(max_tool_items)
+    if total <= max_tool_items:
+        obs["returned_items"] = total
+        obs["truncated"] = False
+        return obs
+
+    def _ts_key(x: Any) -> datetime:
+        ts = x.get("ts") if isinstance(x, dict) else None
+        if isinstance(ts, datetime):
+            return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+        if isinstance(ts, str):
+            dt = parse_datetime(ts)
+            if isinstance(dt, datetime):
+                return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    def _id_key(x: Any) -> str:
+        if isinstance(x, dict):
+            v = x.get("message_id")
+            return "" if v is None else str(v)
+        return ""
+
+    sorted_items = sorted(items, key=lambda x: (_ts_key(x), _id_key(x)), reverse=True)
+    trimmed = sorted_items[:max_tool_items]
+    obs["items"] = trimmed
+    obs["returned_items"] = len(trimmed)
+    obs["truncated"] = True
+    obs["truncate_reason"] = "too_many_items_returned"
+    obs["truncate_policy"] = "sort_by_ts_desc_message_id_desc_then_take_first"
+    obs["sort"] = "ts_desc_message_id_desc"
+    # Cursor ordering may no longer match after truncation; disable it to avoid misuse.
+    obs["next_cursor"] = None
+    obs["anchors"] = [(str(it.get("message_id")), "latest_after_truncation") for it in trimmed[:3] if isinstance(it, dict) and it.get("message_id")]
+    return obs
 
 
 def _summarize_tool_args(tool: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -104,7 +268,7 @@ def _summarize_tool_args(tool: str, args: dict[str, Any]) -> dict[str, Any]:
 def _format_tool_call_human(tool: str, args: dict[str, Any]) -> str:
     if tool == "messages_list":
         return (
-            f"role={args.get('role')} since={args.get('since')} until={args.get('until')} "
+            f"role={args.get('role')} since={args.get('since')!r} until={args.get('until')!r} "
             f"page_size={args.get('page_size')} cursor={'yes' if args.get('cursor') else 'no'}"
         )
 
@@ -117,10 +281,10 @@ def _format_tool_call_human(tool: str, args: dict[str, Any]) -> str:
         role = (filt or {}).get("role")
         if tool == "lexical_search":
             return (
-                f"query={query_text!r} role={role} since={since} until={until} "
+                f"query={query_text!r} role={role} since={since!r} until={until!r} "
                 f"page_size={args.get('page_size')} cursor={'yes' if args.get('cursor') else 'no'}"
             )
-        return f"query={query_text!r} role={role} since={since} until={until} top_k={args.get('top_k')} min_score={args.get('min_score')}"
+        return f"query={query_text!r} role={role} since={since!r} until={until!r} top_k={args.get('top_k')} min_score={args.get('min_score')}"
 
     if tool == "neighbors":
         return f"message_id={args.get('message_id')} before={args.get('before')} after={args.get('after')}"
@@ -133,6 +297,11 @@ def _log_tool_observation(*, iteration: int, tool: str, safe_obs: dict[str, Any]
     anchors = safe_obs.get("anchors") or []
     next_cursor = safe_obs.get("next_cursor")
     applied = safe_obs.get("applied_limits") or {}
+    total_items = safe_obs.get("total_items")
+    returned_items = safe_obs.get("returned_items")
+    truncated = safe_obs.get("truncated")
+    max_tool_items = safe_obs.get("max_tool_items")
+    err = safe_obs.get("error")
 
     role = None
     since = None
@@ -145,16 +314,26 @@ def _log_tool_observation(*, iteration: int, tool: str, safe_obs: dict[str, Any]
             until = tr.get("until")
 
     logger.info(
-        "recall.obs iter=%s tool=%s items=%s anchors=%s next_cursor=%s role=%s since=%s until=%s",
+        "recall.obs iter=%s tool=%s returned_items=%s total_items=%s truncated=%s max_tool_items=%s anchors=%s next_cursor=%s role=%s since=%s until=%s",
         iteration,
         tool,
-        len(items) if isinstance(items, list) else 0,
+        returned_items if returned_items is not None else (len(items) if isinstance(items, list) else 0),
+        total_items if total_items is not None else (len(items) if isinstance(items, list) else 0),
+        bool(truncated) if truncated is not None else False,
+        max_tool_items,
         len(anchors) if isinstance(anchors, list) else 0,
         bool(next_cursor),
         role,
         since,
         until,
     )
+    if isinstance(err, dict):
+        et = err.get("type")
+        details = err.get("details")
+        first = None
+        if isinstance(details, list) and details:
+            first = details[0]
+        logger.info("recall.obs_error iter=%s tool=%s type=%s first=%s", iteration, tool, et, _clip_text(str(first), 500))
 
     if isinstance(anchors, list):
         for idx, a in enumerate(anchors[:3], start=1):
@@ -185,13 +364,6 @@ class RecallAgentDefaults:
     neighbors_before: int = 8
     neighbors_after: int = 0
     messages_page_size: int = 100
-
-    max_page_size: int = 200
-    max_neighbors: int = 200
-    max_top_k: int = 200
-
-    max_iterations: int = 3
-    max_evidence: int = 6
     lexical_page_size: int = 50
     semantic_top_k: int = 20
     semantic_min_score: float = 0.0
@@ -201,13 +373,6 @@ class RecallAgentDefaults:
     allowed_role_values: list[str] = None  # type: ignore[assignment]
     embedding_provider: str = "bigmodel"
     embedding_model: str = "embedding-3"
-
-
-def _load_recall_agent_config() -> dict[str, Any]:
-    path = Path(settings.recall_agent_config_path)
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _msg_to_dict(m) -> dict[str, Any]:
@@ -237,37 +402,10 @@ class RecallAgent:
         # from the displayed skill list for this task.
         self.pinned_skill_id = skill_name
         self.skill = None
-        self.defaults = self._defaults_from_config(_load_recall_agent_config())
-
-    def _defaults_from_config(self, config: dict[str, Any]) -> RecallAgentDefaults:
-        d = (config or {}).get("defaults") or {}
-        try:
-            allowed = d.get("allowed_tools") or ["messages_list", "lexical_search", "semantic_search", "neighbors"]
-            allowed_roles = d.get("allowed_role_values") or ["user", "any"]
-            return RecallAgentDefaults(
-                messages_page_size=int(d.get("messages_page_size", 100)),
-                neighbors_before=int(d.get("neighbors_before", 8)),
-                neighbors_after=int(d.get("neighbors_after", 0)),
-                max_page_size=int(d.get("max_page_size", 200)),
-                max_neighbors=int(d.get("max_neighbors", 200)),
-                max_top_k=int(d.get("max_top_k", 200)),
-                max_iterations=int(d.get("max_iterations", 3)),
-                max_evidence=int(d.get("max_evidence", 6)),
-                lexical_page_size=int(d.get("lexical_page_size", 50)),
-                semantic_top_k=int(d.get("semantic_top_k", 20)),
-                semantic_min_score=float(d.get("semantic_min_score", 0.0)),
-                fallback_query_text=str(d.get("fallback_query_text", "偏好 背景 约束")),
-                state_top_items=int(d.get("state_top_items", 3)),
-                allowed_tools=[str(x) for x in allowed],
-                allowed_role_values=[str(x) for x in allowed_roles],
-                embedding_provider=str(d.get("embedding_provider", "bigmodel")),
-                embedding_model=str(d.get("embedding_model", "embedding-3")),
-            )
-        except Exception:
-            return RecallAgentDefaults(
-                allowed_tools=["messages_list", "lexical_search", "semantic_search", "neighbors"],
-                allowed_role_values=["user", "any"],
-            )
+        self.defaults = RecallAgentDefaults(
+            allowed_tools=["messages_list", "lexical_search", "semantic_search", "neighbors"],
+            allowed_role_values=["user", "any"],
+        )
 
     def run(
         self,
@@ -282,7 +420,7 @@ class RecallAgent:
             skill_id,
             len(question or ""),
             settings.llm_model,
-            self.defaults.max_iterations,
+            settings.recall_max_iterations,
         )
         client = get_chat_client()
         try:
@@ -296,9 +434,11 @@ class RecallAgent:
             "你是一个记忆检索工具编排 Agent。你已经加载了当前任务的 skill。\n"
             "接下来你要做的是：反复选择合适的工具进行检索，直到你认为证据已足够。\n"
             "工具调用必须使用 tool_calls（函数调用）方式；工具结果会以 role=tool 的消息追加到对话里。\n"
+            "运行时会在每次工具调用后做硬约束：若返回 items 过多，会按时间倒序（最新在前）截断到 max_tool_items，并告知 total_items 与截断原因。\n"
             "硬性要求：messages_list/lexical_search/semantic_search 必须显式提供 time_range 与 role（role 可为 any）。\n"
+            "硬性要求：拿不准、且允许不填的参数就不要填写（例如 until/cursor/min_score/page_size/top_k/before/after 等），让运行时默认值接管。\n"
             "建议：每次最多调用 1 个工具；尽量先收窄再扩展；找到锚点后优先 neighbors 补上下文。\n"
-            "当你不再需要调用工具时：不要再发起 tool_calls，改为输出简短文本（例如 DONE）。\n"
+            "当你不再需要调用工具时：不要再发起 tool_calls，按 skill 规定的最终输出格式，直接输出最终 JSON（只输出 JSON，不要 Markdown/代码块）。\n"
         )
 
         # Rebuild a clean planning conversation:
@@ -315,57 +455,54 @@ class RecallAgent:
             len(self.skill.text or ""),
         )
 
-        evidence_msgs, final_limits = self._run_llm_loop(client=client, conversation=conversation)
-
-        memory_view = self._synthesize(client=client, conversation=conversation)
-        logger.info(
-            "recall.done evidence=%s preferences=%s profile=%s constraints=%s",
-            len(evidence_msgs),
-            len(memory_view.preferences),
-            len(memory_view.profile),
-            len(memory_view.constraints),
-        )
+        memory_view, evidence_message_ids = self._run_llm_loop(client=client, conversation=conversation)
+        evidence_items = self._fetch_messages_by_ids(evidence_message_ids)
+        logger.info("recall.done evidence_items=%s memory_view_len=%s", len(evidence_items), len(memory_view or ""))
 
         return RecallResponse(
             memory_view=memory_view,
-            evidence=evidence_msgs,
-            limits=RecallLimits(
-                time_range=TimeRange(
-                    since=parse_datetime((final_limits.get("time_range") or {}).get("since")),
-                    until=parse_datetime((final_limits.get("time_range") or {}).get("until")),
-                ),
-                role=str(final_limits.get("role") or "any"),
-            ),
+            evidence=evidence_items,
         )
+
+    def _to_chat_message(self, m: Message) -> ChatMessage:
+        return ChatMessage(
+            message_id=m.message_id,
+            ts=m.ts,
+            user_id=m.user_id,
+            role=m.role,
+            content=m.content,
+            meta=m.meta,
+        )
+
+    def _fetch_messages_by_ids(self, message_ids: list[str]) -> list[ChatMessage]:
+        ids = [str(x) for x in (message_ids or []) if str(x).strip()]
+        if not ids:
+            return []
+        stmt = select(Message).where(Message.user_id == self.user_id, Message.message_id.in_(ids))
+        rows = list(self.db.execute(stmt).scalars().all())
+        by_id = {m.message_id: m for m in rows}
+        out: list[ChatMessage] = []
+        for mid in ids:
+            m = by_id.get(mid)
+            if m is None:
+                continue
+            out.append(self._to_chat_message(m))
+        return out
 
     def _run_llm_loop(
         self,
         *,
         client: Any,
         conversation: list[BigModelMessage],
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        evidence: list[dict[str, Any]] = []
-        anchors: list[tuple[str, str]] = []  # (message_id, why)
-
-        # The user only provides a natural-language `question`; do NOT pre-impose time_range/role.
-        # The skill-driven planner must infer and apply filters via tool args when needed.
-        current_since: Optional[datetime] = None
-        current_until: Optional[datetime] = None
-        current_role: Optional[str] = None
-
-        for i in range(self.defaults.max_iterations):
+    ) -> tuple[str, list[str]]:
+        max_format_retries = 2
+        format_retries = 0
+        for i in range(settings.recall_max_iterations):
             iteration = i + 1
-            remaining = self.defaults.max_iterations - iteration
-            logger.info("recall.iter iter=%s/%s remaining=%s evidence=%s", iteration, self.defaults.max_iterations, remaining, len(evidence))
-            logger.debug(
-                "recall.loop state since=%s until=%s role=%s conversation_msgs=%s",
-                current_since.isoformat() if current_since else None,
-                current_until.isoformat() if current_until else None,
-                current_role or "any",
-                len(conversation),
-            )
+            remaining = settings.recall_max_iterations - iteration
+            logger.info("recall.iter iter=%s/%s remaining=%s", iteration, settings.recall_max_iterations, remaining)
+            logger.debug("recall.loop state conversation_msgs=%s", len(conversation))
 
-            t0 = time.monotonic()
             msg = client.chat_message(
                 model=settings.llm_model,
                 messages=conversation,
@@ -393,11 +530,40 @@ class RecallAgent:
             )
 
             if not tool_calls:
-                logger.info("recall.stop iter=%s reason=no_tool_calls", iteration)
-                break
+                try:
+                    out = SynthesisOutput.model_validate(_extract_first_json_object(str(content or "")))
+                    memory_view = str(out.memory_view or "").strip()
+                    evidence_message_ids = [str(x) for x in (out.evidence_message_ids or []) if str(x).strip()]
+                    logger.info("recall.stop iter=%s reason=synthesis_ok", iteration)
+                    return (memory_view, evidence_message_ids)
+                except Exception as e:
+                    format_retries += 1
+                    logger.info(
+                        "recall.stop iter=%s reason=synthesis_invalid err=%s",
+                        iteration,
+                        _clip_text(f"{type(e).__name__}: {e}", 300),
+                    )
+                    if format_retries > max_format_retries:
+                        raise RecallAgentError(
+                            "Recall synthesis output was invalid JSON after retries",
+                            code="synthesis_invalid",
+                        ) from e
+
+                    # Ask the model to re-format in-place (same conversation) without tool calls.
+                    example = example_json_for_prompt(SynthesisOutput)
+                    conversation.append(
+                        BigModelMessage(
+                            role="user",
+                            content=(
+                                "上一步你已经停止调用工具了。现在请直接给出最终结果。\n"
+                                "要求：只输出 1 个 JSON 对象；不要 Markdown/代码块；不要多余解释文字。\n"
+                                f"EXAMPLE:{example}\n"
+                            ),
+                        )
+                    )
+                    continue
 
             # Execute each tool call and feed results back as role=tool messages.
-            stop_loop = False
             for j, tc in enumerate(tool_calls):
                 if not isinstance(tc, dict):
                     continue
@@ -420,7 +586,16 @@ class RecallAgent:
 
                 logger.info("recall.act iter=%s tool=%s tool_call_id=%s %s", iteration, tool, tc_id, _format_tool_call_human(tool, args))
                 t1 = time.monotonic()
-                obs = self._execute_tool(tool=tool, args=args)
+                try:
+                    validated_args = _validate_tool_args(tool=tool, args=args)
+                    obs = self._execute_tool(tool=tool, args=validated_args)
+                except ValidationError as e:
+                    obs = {
+                        "tool": tool,
+                        "items": [],
+                        "error": {"type": "validation_error", "details": e.errors(include_url=False)[:3]},
+                    }
+                obs = _apply_tool_item_budget(obs, max_tool_items=settings.recall_max_tool_items)
                 logger.debug("recall.tool_result applied_limits=%s", obs.get("applied_limits"))
                 safe_obs = _make_observation_safe(obs)
                 logger.debug("recall.tool_exec_elapsed iter=%s tool=%s elapsed_ms=%s", iteration, tool, int((time.monotonic() - t1) * 1000))
@@ -432,94 +607,45 @@ class RecallAgent:
                         content=json.dumps(safe_obs, ensure_ascii=False),
                     )
                 )
-
-                # Update anchors/evidence.
-                prev_evidence = len(evidence)
-                for item in obs.get("items") or []:
-                    if item.get("role") == "system":
-                        continue
-                    key = (item["user_id"], item["message_id"])
-                    if any((e["user_id"], e["message_id"]) == key for e in evidence):
-                        continue
-                    evidence.append(item)
-                if len(evidence) != prev_evidence:
-                    logger.debug("recall.evidence added=%s total=%s", len(evidence) - prev_evidence, len(evidence))
-
-                if obs.get("anchors"):
-                    anchors.extend(obs["anchors"])
-
-                applied = obs.get("applied_limits") or {}
-                if isinstance(applied, dict):
-                    tr = applied.get("time_range") or {}
-                    if isinstance(tr, dict):
-                        current_since = parse_datetime(tr.get("since")) or current_since
-                        current_until = parse_datetime(tr.get("until")) or current_until
-                    role_val = applied.get("role")
-                    current_role = None if role_val in (None, "any") else ("user" if role_val == "user" else current_role)
-
-                if len(evidence) >= self.defaults.max_evidence:
-                    logger.info("recall.stop iter=%s reason=evidence_cap cap=%s", iteration, self.defaults.max_evidence)
-                    stop_loop = True
-                    break
-            if stop_loop:
-                break
         else:
-            logger.error("recall.loop max_iterations_exceeded max_iterations=%s", self.defaults.max_iterations)
+            logger.error("recall.loop max_iterations_exceeded max_iterations=%s", settings.recall_max_iterations)
             raise RecallAgentError(
                 "Recall planner exceeded max_iterations without stop=true",
                 code="max_iterations_exceeded",
             )
 
-        final_limits = {
-            "time_range": {
-                "since": current_since.isoformat() if current_since else None,
-                "until": current_until.isoformat() if current_until else None,
-            },
-            "role": current_role or "any",
-        }
-        return (evidence[: self.defaults.max_evidence], final_limits)
-
-    def _format_observation(self, obs: dict[str, Any]) -> str:
-        return "OBSERVATION_JSON:\n" + json.dumps(_make_observation_safe(obs), ensure_ascii=False)
-
     def _execute_tool(
         self,
         *,
         tool: str,
-        args: dict[str, Any],
+        args: Any,
     ) -> dict[str, Any]:
-        logger.debug("recall.tool_exec tool=%s args=%s", tool, _summarize_tool_args(tool, args))
+        # Note: args are already validated via Pydantic (see _validate_tool_args in _run_llm_loop).
+        logger.debug("recall.tool_exec tool=%s", tool)
         # Enforce user binding. The model must explicitly provide filters (no default fallbacks).
         if tool == "messages_list":
-            if "since" not in args and "until" not in args:
-                raise ValueError("messages_list requires args.since and/or args.until")
-            if "role" not in args:
-                raise ValueError("messages_list requires args.role (use 'any' to disable role filtering)")
-
-            since = args.get("since")
-            until = args.get("until")
-            role_arg = args.get("role")
-            page_size = int(args.get("page_size") or self.defaults.messages_page_size)
-            cursor = args.get("cursor")
+            a: MessagesListArgs = args
+            since_dt = a.since
+            until_dt = a.until
+            role_val = str(a.role)
+            page_size = int(a.page_size or self.defaults.messages_page_size)
+            cursor = a.cursor
             try:
                 anchor = parse_seek_anchor(cursor, expected_kind="messages_list") if cursor else None
             except CursorError:
                 anchor = None
-
-            since_dt = parse_datetime(since)
-            until_dt = parse_datetime(until)
-            role_val = str(role_arg) if role_arg is not None else ""
             role_dt = None if role_val == "any" else role_val
             if role_val and role_val not in set(self.defaults.allowed_role_values or []):
                 raise ValueError(f"messages_list role not allowed: {role_val}")
 
+            fetch_size = page_size + 1 if page_size > 0 else 1
             items = list_messages(
                 self.db,
                 user_id=self.user_id,
                 since=since_dt,
                 until=until_dt,
                 role=role_dt,
-                page_size=min(page_size, self.defaults.max_page_size),
+                page_size=fetch_size,
                 anchor=anchor,
             )
             out_items = [_msg_to_dict(m) for m in items]
@@ -531,9 +657,11 @@ class RecallAgent:
                     out_items[-1].get("ts"),
                 )
             next_cursor = None
-            if items:
-                last = items[-1]
+            if len(items) > page_size and page_size > 0:
+                last = items[page_size - 1]
                 next_cursor = make_seek_cursor(kind="messages_list", ts=last.ts, message_id=last.message_id)
+                items = items[:page_size]
+                out_items = out_items[:page_size]
             applied_limits = {
                 "time_range": {"since": since_dt.isoformat() if since_dt else None, "until": until_dt.isoformat() if until_dt else None},
                 "role": role_val or "any",
@@ -541,27 +669,16 @@ class RecallAgent:
             return {"tool": tool, "items": out_items, "next_cursor": next_cursor, "applied_limits": applied_limits}
 
         if tool == "lexical_search":
-            if "query_text" not in args:
-                raise ValueError("lexical_search requires args.query_text")
-            query_text = str(args.get("query_text") or "").strip()
-            filt = args.get("filter")
-            if not isinstance(filt, dict):
-                raise ValueError("lexical_search requires args.filter (object)")
-            tr = (filt.get("time_range") or {}) if isinstance(filt, dict) else {}
-            if not isinstance(tr, dict) or ("since" not in tr and "until" not in tr):
-                raise ValueError("lexical_search requires filter.time_range.since and/or filter.time_range.until")
-            if "role" not in filt:
-                raise ValueError("lexical_search requires filter.role (use 'any' to disable role filtering)")
-
-            since_dt = parse_datetime(tr.get("since"))
-            until_dt = parse_datetime(tr.get("until"))
-            role_arg = filt.get("role")
-            role_val = str(role_arg) if role_arg is not None else ""
+            a: LexicalSearchArgs = args
+            query_text = str(a.query_text or "").strip()
+            since_dt = a.filter.time_range.since
+            until_dt = a.filter.time_range.until
+            role_val = str(a.filter.role)
             role_dt = None if role_val == "any" else role_val
             if role_val and role_val not in set(self.defaults.allowed_role_values or []):
                 raise ValueError(f"lexical_search role not allowed: {role_val}")
-            page_size = int(args.get("page_size") or self.defaults.lexical_page_size)
-            cursor = args.get("cursor")
+            page_size = int(a.page_size or self.defaults.lexical_page_size)
+            cursor = a.cursor
             anchor = None
             if cursor:
                 try:
@@ -581,21 +698,18 @@ class RecallAgent:
                 since=since_dt,
                 until=until_dt,
                 role=role_dt,
-                page_size=min(page_size, self.defaults.max_page_size),
+                page_size=(page_size + 1 if page_size > 0 else 1),
                 anchor=anchor,
             )
             logger.debug("recall.lexical_search rows=%s", len(rows))
+            next_cursor = None
+            if len(rows) > page_size and page_size > 0:
+                m, rank = rows[page_size - 1]
+                next_cursor = make_seek_cursor(kind="lexical_search", ts=m.ts, message_id=m.message_id, extra={"rank": round(float(rank), 8)})
+                rows = rows[:page_size]
+
             items = [_msg_to_dict(m) for (m, _rank) in rows]
             anchors = [(m.message_id, "lexical_top") for (m, _rank) in rows[:3]]
-            next_cursor = None
-            if rows:
-                m, rank = rows[-1]
-                next_cursor = make_seek_cursor(
-                    kind="lexical_search",
-                    ts=m.ts,
-                    message_id=m.message_id,
-                    extra={"rank": round(float(rank), 8)},
-                )
             applied_limits = {
                 "time_range": {"since": since_dt.isoformat() if since_dt else None, "until": until_dt.isoformat() if until_dt else None},
                 "role": role_val or "any",
@@ -603,25 +717,16 @@ class RecallAgent:
             return {"tool": tool, "items": items, "anchors": anchors, "next_cursor": next_cursor, "applied_limits": applied_limits}
 
         if tool == "semantic_search":
-            query_text = str(args.get("query_text") or "").strip()
-            filt = args.get("filter")
-            if not isinstance(filt, dict):
-                raise ValueError("semantic_search requires args.filter (object)")
-            tr = (filt.get("time_range") or {}) if isinstance(filt, dict) else {}
-            if not isinstance(tr, dict) or ("since" not in tr and "until" not in tr):
-                raise ValueError("semantic_search requires filter.time_range.since and/or filter.time_range.until")
-            if "role" not in filt:
-                raise ValueError("semantic_search requires filter.role (use 'any' to disable role filtering)")
-
-            since_dt = parse_datetime(tr.get("since"))
-            until_dt = parse_datetime(tr.get("until"))
-            role_arg = filt.get("role")
-            role_val = str(role_arg) if role_arg is not None else ""
+            a: SemanticSearchArgs = args
+            query_text = str(a.query_text or "").strip()
+            since_dt = a.filter.time_range.since
+            until_dt = a.filter.time_range.until
+            role_val = str(a.filter.role)
             role_dt = None if role_val == "any" else role_val
             if role_val and role_val not in set(self.defaults.allowed_role_values or []):
                 raise ValueError(f"semantic_search role not allowed: {role_val}")
-            top_k = int(args.get("top_k") or self.defaults.semantic_top_k)
-            min_score = args.get("min_score")
+            top_k = int(a.top_k or self.defaults.semantic_top_k)
+            min_score = a.min_score
             if min_score is None:
                 min_score = self.defaults.semantic_min_score
             provider = self.defaults.embedding_provider
@@ -643,7 +748,7 @@ class RecallAgent:
                 since=since_dt,
                 until=until_dt,
                 role=role_dt,
-                top_k=min(top_k, self.defaults.max_top_k),
+                top_k=top_k,
                 min_score=float(min_score) if min_score is not None else None,
                 provider=provider,
                 model=model,
@@ -658,15 +763,16 @@ class RecallAgent:
             return {"tool": tool, "items": items, "anchors": anchors, "applied_limits": applied_limits}
 
         if tool == "neighbors":
-            message_id = str(args.get("message_id") or "")
-            before = int(args.get("before") or self.defaults.neighbors_before)
-            after = int(args.get("after") or self.defaults.neighbors_after)
+            a: NeighborsArgs = args
+            message_id = str(a.message_id or "")
+            before = int(a.before or self.defaults.neighbors_before)
+            after = int(a.after or self.defaults.neighbors_after)
             items = get_neighbors(
                 self.db,
                 user_id=self.user_id,
                 message_id=message_id,
-                before=min(before, self.defaults.max_neighbors),
-                after=min(after, self.defaults.max_neighbors),
+                before=before,
+                after=after,
             )
             logger.debug("recall.neighbors items=%s message_id=%s", len(items), message_id)
             applied_limits = {
@@ -677,50 +783,4 @@ class RecallAgent:
 
         return {"tool": tool, "items": []}
 
-    # --- Synthesis ---
-
-    def _synthesize(self, *, client: Any, conversation: list[BigModelMessage]) -> MemoryView:
-        max_structured_retries = 3
-
-        synth_prompt = (
-            "现在请基于历史对话中的工具调用结果（role=tool 的 JSON 内容）合成 memory_view。\n"
-            "只允许输出被证据支持的条目；证据不足则对应数组保持为空。\n"
-            "只输出一个 JSON 对象，必须匹配以下 schema。\n"
-            f"SCHEMA:{schema_json_for_prompt(SynthesisOutput)}\n"
-            f"EXAMPLE:{example_json_for_prompt(SynthesisOutput)}\n"
-        )
-        last_err: Optional[Exception] = None
-        out: SynthesisOutput | None = None
-        for attempt in range(1, max_structured_retries + 1):
-            try:
-                t0 = time.monotonic()
-                out = SynthesisOutput.model_validate(
-                    client.chat_json(
-                        model=settings.llm_model,
-                        messages=conversation + [BigModelMessage(role="user", content=synth_prompt)],
-                        temperature=0.2,
-                    )
-                )
-                last_err = None
-                logger.debug("recall.synthesis attempt=%s/%s ok elapsed_ms=%s", attempt, max_structured_retries, int((time.monotonic() - t0) * 1000))
-                break
-            except Exception as e:
-                last_err = e
-                out = None
-                logger.warning(
-                    "recall.synthesis attempt=%s/%s failed (%s): %s",
-                    attempt,
-                    max_structured_retries,
-                    type(e).__name__,
-                    str(e),
-                )
-                continue
-        if last_err is not None or out is None:
-            logger.exception("recall.synthesis failed after %s attempts", max_structured_retries)
-            raise last_err or RuntimeError("Failed to obtain valid synthesis output")
-
-        return MemoryView(
-            preferences=[str(x) for x in out.preferences],
-            profile=[str(x) for x in out.profile],
-            constraints=[str(x) for x in out.constraints],
-        )
+    # Synthesis is handled inside _run_llm_loop (same retrieval context).

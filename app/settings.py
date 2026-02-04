@@ -13,7 +13,9 @@ class Settings(BaseSettings):
     cursor_secret: str = "dev-insecure"
 
     recall_skill: str = "nomemory-recall-default"
-    recall_agent_config_path: str = "config/recall_agent.json"
+    # Recall agent hard budgets (context safety, not tool performance).
+    recall_max_iterations: int = 3
+    recall_max_tool_items: int = 50
 
     # LLM (agent reasoning) model selection
     llm_provider: str = "bigmodel"
