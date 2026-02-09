@@ -90,3 +90,14 @@ class RecallResponse(BaseModel):
     memory_view: str = Field(default="")
     # Evidence messages supporting the summary.
     evidence: list[ChatMessage] = Field(default_factory=list)
+
+
+class LocomoQARequest(BaseModel):
+    question: str = Field(min_length=1)
+    # Optional time anchor (ISO8601). If not provided, the service will fall back to the latest message ts.
+    now: Optional[datetime] = None
+
+
+class LocomoQAResponse(BaseModel):
+    answer: str = Field(default="")
+    evidence: list[ChatMessage] = Field(default_factory=list)

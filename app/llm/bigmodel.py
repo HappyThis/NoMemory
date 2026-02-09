@@ -57,11 +57,20 @@ class BigModelClient:
         payload: dict[str, Any] = {"model": model, "input": inputs}
         if dimensions is not None:
             payload["dimensions"] = dimensions
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(settings.bigmodel_embedding_endpoint, headers=self._headers(), json=payload)
-            if r.status_code >= 400:
-                raise BigModelError(f"Embeddings API error: {r.status_code} {r.text}")
-            data = r.json()
+        try:
+            with httpx.Client(timeout=float(settings.bigmodel_embedding_timeout_sec)) as client:
+                r = client.post(settings.bigmodel_embedding_endpoint, headers=self._headers(), json=payload)
+                if r.status_code >= 400:
+                    raise BigModelError(
+                        f"Embeddings API error: {r.status_code} {r.text}",
+                        status_code=r.status_code,
+                        response_text=r.text,
+                    )
+                data = r.json()
+        except httpx.TimeoutException as e:
+            raise BigModelError("Embeddings API timeout", status_code=504) from e
+        except httpx.RequestError as e:
+            raise BigModelError(f"Embeddings API request error: {type(e).__name__}: {e}", status_code=502) from e
         items = data.get("data") or []
         embeddings: list[list[float]] = []
         for item in items:
@@ -74,15 +83,20 @@ class BigModelClient:
         return embeddings
 
     def _chat_raw(self, *, payload: dict[str, Any]) -> dict[str, Any]:
-        with httpx.Client(timeout=60.0) as client:
-            r = client.post(settings.bigmodel_chat_endpoint, headers=self._headers(), json=payload)
-            if r.status_code >= 400:
-                raise BigModelError(
-                    f"Chat API error: {r.status_code} {r.text}",
-                    status_code=r.status_code,
-                    response_text=r.text,
-                )
-            return r.json()
+        try:
+            with httpx.Client(timeout=float(settings.bigmodel_chat_timeout_sec)) as client:
+                r = client.post(settings.bigmodel_chat_endpoint, headers=self._headers(), json=payload)
+                if r.status_code >= 400:
+                    raise BigModelError(
+                        f"Chat API error: {r.status_code} {r.text}",
+                        status_code=r.status_code,
+                        response_text=r.text,
+                    )
+                return r.json()
+        except httpx.TimeoutException as e:
+            raise BigModelError("Chat API timeout", status_code=504) from e
+        except httpx.RequestError as e:
+            raise BigModelError(f"Chat API request error: {type(e).__name__}: {e}", status_code=502) from e
 
     def chat(self, *, messages: list[BigModelMessage], model: str, temperature: float = 0.2) -> str:
         payload = {

@@ -26,3 +26,5 @@ htmlcov/
 # Logs
 *.log
 
+# Benchmark traces
+traces/locomo/

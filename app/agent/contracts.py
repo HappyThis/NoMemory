@@ -60,6 +60,22 @@ class SynthesisOutput(BaseModel):
     )
 
 
+class LocomoQAOutput(BaseModel):
+    """Contract for LoCoMo-style QA final answer output (for benchmark scoring)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str = Field(
+        default="",
+        description="对问题的最终答案（尽量复用对话中的原词；简短；不编造）。未知则输出字符串 'unknown'。",
+        examples=["unknown"],
+    )
+    evidence_message_ids: list[str] = Field(
+        default_factory=list,
+        description="支撑该答案的证据 message_id 列表（按重要性排序）。",
+        examples=[[]],
+    )
+
 class SkillSelectionOutput(BaseModel):
     """Contract for selecting which skill to use for the current task."""
 
@@ -93,6 +109,10 @@ def example_json_for_prompt(model: type[BaseModel]) -> str:
     if model is SynthesisOutput:
         # Use an "empty lists" example to avoid biasing the model into hallucinating specific facts.
         ex = SynthesisOutput(memory_view="", evidence_message_ids=[])
+        return ex.model_dump_json(ensure_ascii=False)
+    if model is LocomoQAOutput:
+        # For LoCoMo QA, we want a stable "unknown" token for unanswerable questions.
+        ex = LocomoQAOutput(answer="unknown", evidence_message_ids=[])
         return ex.model_dump_json(ensure_ascii=False)
     if model is SkillSelectionOutput:
         ex = SkillSelectionOutput(skill_id="nomemory-recall-default")

@@ -6,13 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.log import get_logger
 from app.agent.errors import RecallAgentError
-from app.agent.contracts import SynthesisOutput, example_json_for_prompt
+from app.agent.contracts import LocomoQAOutput, SynthesisOutput, example_json_for_prompt
 from app.api.schemas import ChatMessage, RecallResponse
 from app.llm.bigmodel import BigModelMessage
 from app.llm.embeddings import embed_query_text
@@ -160,6 +160,61 @@ def _extract_first_json_object(text: str) -> dict[str, Any]:
     if not isinstance(v2, dict):
         raise ValueError("Expected JSON object")
     return v2
+
+
+def _normalize_bigmodel_tool_args(args: dict[str, Any]) -> dict[str, Any]:
+    """
+    Normalize provider-specific argument tagging formats into a plain JSON args dict.
+
+    Observed format:
+      {"query_text<arg_value>xxx</arg_value><arg_key>filter": "{\"role\":\"user\",...}"}
+    Rewritten to:
+      {"query_text": "xxx", "filter": {...}}
+    """
+    if not isinstance(args, dict):
+        return {}
+
+    out: dict[str, Any] = dict(args)
+
+    for raw_key, raw_val in list(args.items()):
+        if not isinstance(raw_key, str):
+            continue
+        if "<arg_value>" not in raw_key or "</arg_value>" not in raw_key or "<arg_key>" not in raw_key:
+            continue
+        try:
+            k1, rest = raw_key.split("<arg_value>", 1)
+            v1, rest2 = rest.split("</arg_value>", 1)
+            _unused, k2 = rest2.split("<arg_key>", 1)
+            k1 = k1.strip()
+            k2 = k2.strip()
+        except Exception:
+            continue
+
+        if k1 and k1 not in out:
+            out[k1] = v1
+
+        if k2 and k2 not in out:
+            v2: Any = raw_val
+            if isinstance(v2, str):
+                vv = v2.strip()
+                if vv.startswith("{") and vv.endswith("}"):
+                    try:
+                        v2 = json.loads(vv)
+                    except Exception:
+                        v2 = raw_val
+            out[k2] = v2
+
+        out.pop(raw_key, None)
+
+    if isinstance(out.get("filter"), str):
+        s = str(out["filter"]).strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                out["filter"] = json.loads(s)
+            except Exception:
+                pass
+
+    return out
 
 
 def _apply_tool_item_budget(obs: dict[str, Any], *, max_tool_items: int) -> dict[str, Any]:
@@ -404,7 +459,7 @@ class RecallAgent:
         self.skill = None
         self.defaults = RecallAgentDefaults(
             allowed_tools=["messages_list", "lexical_search", "semantic_search", "neighbors"],
-            allowed_role_values=["user", "any"],
+            allowed_role_values=["user", "assistant", "any"],
         )
 
     def run(
@@ -436,8 +491,10 @@ class RecallAgent:
             "工具调用必须使用 tool_calls（函数调用）方式；工具结果会以 role=tool 的消息追加到对话里。\n"
             "运行时会在每次工具调用后做硬约束：若返回 items 过多，会按时间倒序（最新在前）截断到 max_tool_items，并告知 total_items 与截断原因。\n"
             "硬性要求：messages_list/lexical_search/semantic_search 必须显式提供 time_range 与 role（role 可为 any）。\n"
+            "role 取值：user / assistant / any（any=不按 role 过滤）。\n"
             "硬性要求：拿不准、且允许不填的参数就不要填写（例如 until/cursor/min_score/page_size/top_k/before/after 等），让运行时默认值接管。\n"
             "建议：每次最多调用 1 个工具；尽量先收窄再扩展；找到锚点后优先 neighbors 补上下文。\n"
+            "重要：请预留至少 1 次迭代用于最终合成输出（输出最终 JSON）；不要把最后一次迭代用在工具调用上。\n"
             "当你不再需要调用工具时：不要再发起 tool_calls，按 skill 规定的最终输出格式，直接输出最终 JSON（只输出 JSON，不要 Markdown/代码块）。\n"
         )
 
@@ -455,7 +512,12 @@ class RecallAgent:
             len(self.skill.text or ""),
         )
 
-        memory_view, evidence_message_ids = self._run_llm_loop(client=client, conversation=conversation)
+        memory_view, evidence_message_ids = self._run_llm_loop(
+            client=client,
+            conversation=conversation,
+            final_output_model=SynthesisOutput,
+            final_primary_field="memory_view",
+        )
         evidence_items = self._fetch_messages_by_ids(evidence_message_ids)
         logger.info("recall.done evidence_items=%s memory_view_len=%s", len(evidence_items), len(memory_view or ""))
 
@@ -463,6 +525,53 @@ class RecallAgent:
             memory_view=memory_view,
             evidence=evidence_items,
         )
+
+    def run_locomo_qa(
+        self,
+        *,
+        question: str,
+        now: datetime | None = None,
+    ) -> tuple[str, list[ChatMessage]]:
+        skill_id = self.pinned_skill_id or "nomemory-locomo-qa"
+        logger.info(
+            "locomo.start user_id=%s skill_id=%s question_len=%s model=%s max_iterations=%s",
+            self.user_id,
+            skill_id,
+            len(question or ""),
+            settings.llm_model,
+            settings.recall_max_iterations,
+        )
+        client = get_chat_client()
+        self.skill = load_skill(skill_id)
+
+        now_dt = now or self._latest_message_ts() or datetime.now(tz=timezone.utc)
+        tool_rules = (
+            "你是一个记忆检索工具编排 Agent。你已经加载了当前任务的 skill。\n"
+            "接下来你要做的是：反复选择合适的工具进行检索，直到你认为证据已足够。\n"
+            "工具调用必须使用 tool_calls（函数调用）方式；工具结果会以 role=tool 的消息追加到对话里。\n"
+            "运行时会在每次工具调用后做硬约束：若返回 items 过多，会按时间倒序（最新在前）截断到 max_tool_items，并告知 total_items 与截断原因。\n"
+            "硬性要求：messages_list/lexical_search/semantic_search 必须显式提供 time_range 与 role（role 可为 any）。\n"
+            "role 取值：user / assistant / any（any=不按 role 过滤）。\n"
+            "硬性要求：拿不准、且允许不填的参数就不要填写（例如 until/cursor/min_score/page_size/top_k/before/after 等），让运行时默认值接管。\n"
+            "重要：请预留至少 1 次迭代用于最终合成输出（输出最终 JSON）；不要把最后一次迭代用在工具调用上。\n"
+            "当你不再需要调用工具时：不要再发起 tool_calls，按 skill 规定的最终输出格式，直接输出最终 JSON（只输出 JSON，不要 Markdown/代码块）。\n"
+        )
+
+        conversation = [
+            BigModelMessage(role="system", content=self.skill.text),
+            BigModelMessage(role="system", content=tool_rules),
+            BigModelMessage(role="user", content=f"TASK_QUERY:\n{question}\nNOW:\n{now_dt.isoformat()}"),
+        ]
+
+        answer, evidence_message_ids = self._run_llm_loop(
+            client=client,
+            conversation=conversation,
+            final_output_model=LocomoQAOutput,
+            final_primary_field="answer",
+        )
+        evidence_items = self._fetch_messages_by_ids(evidence_message_ids)
+        logger.info("locomo.done evidence_items=%s answer_len=%s", len(evidence_items), len(answer or ""))
+        return (answer, evidence_items)
 
     def _to_chat_message(self, m: Message) -> ChatMessage:
         return ChatMessage(
@@ -489,11 +598,26 @@ class RecallAgent:
             out.append(self._to_chat_message(m))
         return out
 
+    def _latest_message_ts(self) -> datetime | None:
+        stmt = (
+            select(Message.ts)
+            .where(Message.user_id == self.user_id)
+            .order_by(Message.ts.desc(), Message.message_id.desc())
+            .limit(1)
+        )
+        row = self.db.execute(stmt).first()
+        if not row:
+            return None
+        ts = row[0]
+        return ts if isinstance(ts, datetime) else None
+
     def _run_llm_loop(
         self,
         *,
         client: Any,
         conversation: list[BigModelMessage],
+        final_output_model: type[BaseModel],
+        final_primary_field: str,
     ) -> tuple[str, list[str]]:
         max_format_retries = 2
         format_retries = 0
@@ -503,13 +627,21 @@ class RecallAgent:
             logger.info("recall.iter iter=%s/%s remaining=%s", iteration, settings.recall_max_iterations, remaining)
             logger.debug("recall.loop state conversation_msgs=%s", len(conversation))
 
-            msg = client.chat_message(
-                model=settings.llm_model,
-                messages=conversation,
-                temperature=0.2,
-                tools=_bigmodel_tool_schemas(self.defaults.allowed_tools),
-                tool_choice="auto",
-            )
+            allow_tools = iteration < settings.recall_max_iterations
+            if allow_tools:
+                msg = client.chat_message(
+                    model=settings.llm_model,
+                    messages=conversation,
+                    temperature=0.2,
+                    tools=_bigmodel_tool_schemas(self.defaults.allowed_tools),
+                    tool_choice="auto",
+                )
+            else:
+                msg = client.chat_message(
+                    model=settings.llm_model,
+                    messages=conversation,
+                    temperature=0.2,
+                )
             content = msg.get("content")
             if isinstance(content, str) and content:
                 logger.info("recall.think iter=%s content=%s", iteration, _clip_text(content, 500))
@@ -531,11 +663,13 @@ class RecallAgent:
 
             if not tool_calls:
                 try:
-                    out = SynthesisOutput.model_validate(_extract_first_json_object(str(content or "")))
-                    memory_view = str(out.memory_view or "").strip()
-                    evidence_message_ids = [str(x) for x in (out.evidence_message_ids or []) if str(x).strip()]
+                    out = final_output_model.model_validate(_extract_first_json_object(str(content or "")))
+                    primary = getattr(out, final_primary_field, "")
+                    evidence = getattr(out, "evidence_message_ids", [])
+                    primary_text = str(primary or "").strip()
+                    evidence_message_ids = [str(x) for x in (evidence or []) if str(x).strip()]
                     logger.info("recall.stop iter=%s reason=synthesis_ok", iteration)
-                    return (memory_view, evidence_message_ids)
+                    return (primary_text, evidence_message_ids)
                 except Exception as e:
                     format_retries += 1
                     logger.info(
@@ -550,18 +684,60 @@ class RecallAgent:
                         ) from e
 
                     # Ask the model to re-format in-place (same conversation) without tool calls.
-                    example = example_json_for_prompt(SynthesisOutput)
-                    conversation.append(
-                        BigModelMessage(
-                            role="user",
-                            content=(
-                                "上一步你已经停止调用工具了。现在请直接给出最终结果。\n"
-                                "要求：只输出 1 个 JSON 对象；不要 Markdown/代码块；不要多余解释文字。\n"
-                                f"EXAMPLE:{example}\n"
-                            ),
-                        )
+                    example = example_json_for_prompt(final_output_model)
+                    fixup = BigModelMessage(
+                        role="user",
+                        content=(
+                            "上一步你已经停止调用工具了。现在请直接给出最终结果。\n"
+                            "要求：只输出 1 个 JSON 对象；不要 Markdown/代码块；不要多余解释文字。\n"
+                            f"EXAMPLE:{example}\n"
+                        ),
                     )
-                    continue
+
+                    if remaining > 0:
+                        conversation.append(fixup)
+                        continue
+
+                    # Last iteration: do a couple in-place retries (no tools) before failing.
+                    last_err: Exception = e
+                    for attempt in range(1, max_format_retries + 1):
+                        logger.info("recall.synth_retry iter=%s attempt=%s/%s", iteration, attempt, max_format_retries)
+                        conversation.append(fixup)
+                        msg2 = client.chat_message(
+                            model=settings.llm_model,
+                            messages=conversation,
+                            temperature=0.2,
+                        )
+                        content2 = msg2.get("content")
+                        tool_calls2 = msg2.get("tool_calls") or []
+                        if not isinstance(tool_calls2, list):
+                            tool_calls2 = []
+                        conversation.append(
+                            BigModelMessage(
+                                role="assistant",
+                                content=content2,
+                                tool_calls=tool_calls2 or None,
+                            )
+                        )
+                        if tool_calls2:
+                            last_err = RuntimeError("Synthesis retry unexpectedly returned tool_calls")
+                            break
+                        try:
+                            out2 = final_output_model.model_validate(_extract_first_json_object(str(content2 or "")))
+                            primary2 = getattr(out2, final_primary_field, "")
+                            evidence2 = getattr(out2, "evidence_message_ids", [])
+                            primary_text2 = str(primary2 or "").strip()
+                            evidence_message_ids2 = [str(x) for x in (evidence2 or []) if str(x).strip()]
+                            logger.info("recall.stop iter=%s reason=synthesis_ok_retry", iteration)
+                            return (primary_text2, evidence_message_ids2)
+                        except Exception as e2:
+                            last_err = e2
+                            continue
+
+                    raise RecallAgentError(
+                        "Recall synthesis output was invalid JSON after retries",
+                        code="synthesis_invalid",
+                    ) from last_err
 
             # Execute each tool call and feed results back as role=tool messages.
             for j, tc in enumerate(tool_calls):
@@ -579,6 +755,8 @@ class RecallAgent:
                     args = json.loads(arg_text) if arg_text.strip() else {}
                 except Exception:
                     args = {}
+                if isinstance(args, dict):
+                    args = _normalize_bigmodel_tool_args(args)
 
                 if tool not in set(self.defaults.allowed_tools):
                     logger.warning("recall.tool_call tool_not_allowed tool=%s", tool)
@@ -604,7 +782,7 @@ class RecallAgent:
                     BigModelMessage(
                         role="tool",
                         tool_call_id=tc_id,
-                        content=json.dumps(safe_obs, ensure_ascii=False),
+                        content=json.dumps(safe_obs, ensure_ascii=False, default=str),
                     )
                 )
         else:

@@ -3,29 +3,31 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.agent.recall_agent import RecallAgent
 from app.agent.errors import RecallAgentError
-from app.api.schemas import RecallRequest, RecallResponse
+from app.agent.recall_agent import RecallAgent
+from app.api.schemas import LocomoQARequest, LocomoQAResponse
 from app.auth.user import get_user_id
 from app.db.session import get_db
 from app.llm.bigmodel import BigModelError
 from app.settings import settings
 
-router = APIRouter(prefix="/v1", tags=["recall"])
+
+router = APIRouter(prefix="/v1/bench/locomo", tags=["bench", "locomo"])
 
 
-@router.post("/recall", response_model=RecallResponse)
-def recall(req: RecallRequest, user_id: str = Depends(get_user_id), db: Session = Depends(get_db)) -> RecallResponse:
+@router.post("/qa", response_model=LocomoQAResponse)
+def locomo_qa(req: LocomoQARequest, user_id: str = Depends(get_user_id), db: Session = Depends(get_db)) -> LocomoQAResponse:
     if not settings.bigmodel_api_key or settings.llm_provider != "bigmodel":
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="LLM not configured for skill-driven recall (set BIGMODEL_API_KEY and LLM_PROVIDER=bigmodel).",
+            detail="LLM not configured (set BIGMODEL_API_KEY and LLM_PROVIDER=bigmodel).",
         )
-    agent = RecallAgent(db, user_id=user_id)
+
+    agent = RecallAgent(db, user_id=user_id, skill_name="nomemory-locomo-qa")
     try:
-        return agent.run(question=req.question)
+        answer, evidence = agent.run_locomo_qa(question=req.question, now=req.now)
+        return LocomoQAResponse(answer=answer, evidence=evidence)
     except RecallAgentError as e:
-        # Agent couldn't finish within its internal budgets/constraints.
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": e.code, "message": str(e)}) from e
     except BigModelError as e:
         code = getattr(e, "status_code", None)

@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     bigmodel_chat_endpoint: str = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     bigmodel_embedding_endpoint: str = "https://open.bigmodel.cn/api/paas/v4/embeddings"
     bigmodel_embedding_model: str = "embedding-3"
+    bigmodel_chat_timeout_sec: float = 180.0
+    bigmodel_embedding_timeout_sec: float = 30.0
 
 
 settings = Settings()
