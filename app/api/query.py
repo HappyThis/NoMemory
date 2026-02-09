@@ -126,7 +126,7 @@ def semantic_search_api(req: SemanticSearchRequest, db: Session = Depends(get_db
     until = time_range.until if time_range else None
     role = req.filter.role if req.filter else None
 
-    provider = req.provider or settings.llm_provider
+    provider = req.provider or settings.embedding_provider
     model = req.model or settings.bigmodel_embedding_model
 
     if req.query_embedding is None and req.query_text is None:

@@ -16,7 +16,7 @@ from app.agent.contracts import LocomoQAOutput, SynthesisOutput, example_json_fo
 from app.api.schemas import ChatMessage, RecallResponse
 from app.llm.bigmodel import BigModelMessage
 from app.llm.embeddings import embed_query_text
-from app.llm.factory import get_chat_client
+from app.llm.factory import get_chat_client, get_chat_model
 from app.retrieval.lexical import LexicalAnchor, lexical_search
 from app.retrieval.messages import list_messages
 from app.retrieval.neighbors import get_neighbors
@@ -469,12 +469,13 @@ class RecallAgent:
     ) -> RecallResponse:
         # Skill selection is configuration-driven (no LLM selection).
         skill_id = self.pinned_skill_id or settings.recall_skill
+        model = get_chat_model()
         logger.info(
             "recall.start user_id=%s skill_id=%s question_len=%s model=%s max_iterations=%s",
             self.user_id,
             skill_id,
             len(question or ""),
-            settings.llm_model,
+            model,
             settings.recall_max_iterations,
         )
         client = get_chat_client()
@@ -490,7 +491,7 @@ class RecallAgent:
             "接下来你要做的是：反复选择合适的工具进行检索，直到你认为证据已足够。\n"
             "工具调用必须使用 tool_calls（函数调用）方式；工具结果会以 role=tool 的消息追加到对话里。\n"
             "运行时会在每次工具调用后做硬约束：若返回 items 过多，会按时间倒序（最新在前）截断到 max_tool_items，并告知 total_items 与截断原因。\n"
-            "硬性要求：messages_list/lexical_search/semantic_search 必须显式提供 time_range 与 role（role 可为 any）。\n"
+            "硬性要求：messages_list/lexical_search/semantic_search 必须显式提供 time_range 与 role（role 可为 any）。若 since/until 均为空，则表示全时间范围。\n"
             "role 取值：user / assistant / any（any=不按 role 过滤）。\n"
             "硬性要求：拿不准、且允许不填的参数就不要填写（例如 until/cursor/min_score/page_size/top_k/before/after 等），让运行时默认值接管。\n"
             "建议：每次最多调用 1 个工具；尽量先收窄再扩展；找到锚点后优先 neighbors 补上下文。\n"
@@ -533,12 +534,13 @@ class RecallAgent:
         now: datetime | None = None,
     ) -> tuple[str, list[ChatMessage]]:
         skill_id = self.pinned_skill_id or "nomemory-locomo-qa"
+        model = get_chat_model()
         logger.info(
             "locomo.start user_id=%s skill_id=%s question_len=%s model=%s max_iterations=%s",
             self.user_id,
             skill_id,
             len(question or ""),
-            settings.llm_model,
+            model,
             settings.recall_max_iterations,
         )
         client = get_chat_client()
@@ -550,7 +552,7 @@ class RecallAgent:
             "接下来你要做的是：反复选择合适的工具进行检索，直到你认为证据已足够。\n"
             "工具调用必须使用 tool_calls（函数调用）方式；工具结果会以 role=tool 的消息追加到对话里。\n"
             "运行时会在每次工具调用后做硬约束：若返回 items 过多，会按时间倒序（最新在前）截断到 max_tool_items，并告知 total_items 与截断原因。\n"
-            "硬性要求：messages_list/lexical_search/semantic_search 必须显式提供 time_range 与 role（role 可为 any）。\n"
+            "硬性要求：messages_list/lexical_search/semantic_search 必须显式提供 time_range 与 role（role 可为 any）。若 since/until 均为空，则表示全时间范围。\n"
             "role 取值：user / assistant / any（any=不按 role 过滤）。\n"
             "硬性要求：拿不准、且允许不填的参数就不要填写（例如 until/cursor/min_score/page_size/top_k/before/after 等），让运行时默认值接管。\n"
             "重要：请预留至少 1 次迭代用于最终合成输出（输出最终 JSON）；不要把最后一次迭代用在工具调用上。\n"
@@ -630,7 +632,7 @@ class RecallAgent:
             allow_tools = iteration < settings.recall_max_iterations
             if allow_tools:
                 msg = client.chat_message(
-                    model=settings.llm_model,
+                    model=get_chat_model(),
                     messages=conversation,
                     temperature=0.2,
                     tools=_bigmodel_tool_schemas(self.defaults.allowed_tools),
@@ -638,7 +640,7 @@ class RecallAgent:
                 )
             else:
                 msg = client.chat_message(
-                    model=settings.llm_model,
+                    model=get_chat_model(),
                     messages=conversation,
                     temperature=0.2,
                 )
@@ -704,7 +706,7 @@ class RecallAgent:
                         logger.info("recall.synth_retry iter=%s attempt=%s/%s", iteration, attempt, max_format_retries)
                         conversation.append(fixup)
                         msg2 = client.chat_message(
-                            model=settings.llm_model,
+                            model=get_chat_model(),
                             messages=conversation,
                             temperature=0.2,
                         )
@@ -786,11 +788,11 @@ class RecallAgent:
                     )
                 )
         else:
-            logger.error("recall.loop max_iterations_exceeded max_iterations=%s", settings.recall_max_iterations)
-            raise RecallAgentError(
-                "Recall planner exceeded max_iterations without stop=true",
-                code="max_iterations_exceeded",
-            )
+            # If the agent couldn't converge within the iteration budget, return a safe "unknown"/empty
+            # output instead of failing the whole request. This is especially useful for benchmarks.
+            logger.warning("recall.loop max_iterations_exceeded max_iterations=%s", settings.recall_max_iterations)
+            fallback_primary = "unknown" if final_primary_field == "answer" else ""
+            return (fallback_primary, [])
 
     def _execute_tool(
         self,

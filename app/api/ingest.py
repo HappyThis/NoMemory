@@ -24,21 +24,29 @@ def ingest_messages(
     db: Session = Depends(get_db),
 ) -> IngestBatchResponse:
     now = datetime.now(tz=timezone.utc)
-    rows = [
-        {
-            "user_id": user_id,
-            "message_id": uuid.uuid4().hex,
-            "ts": item.ts,
-            "role": item.role,
-            "content": item.content,
-            "meta": item.meta,
-        }
-        for item in req.items
-    ]
+    rows = []
+    seen: set[tuple[str, str]] = set()
+    for item in req.items:
+        message_id = (item.message_id or "").strip() or uuid.uuid4().hex
+        key = (user_id, message_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "user_id": user_id,
+                "message_id": message_id,
+                "ts": item.ts,
+                "role": item.role,
+                "content": item.content,
+                "meta": item.meta,
+            }
+        )
 
     stmt = (
         insert(Message)
         .values(rows)
+        .on_conflict_do_nothing(index_elements=["user_id", "message_id"])
         .returning(Message.user_id, Message.message_id, Message.content)
     )
     inserted = db.execute(stmt).all()
@@ -48,10 +56,11 @@ def ingest_messages(
         background.add_task(
             enqueue_embeddings_for_messages,
             [(r[0], r[1], r[2]) for r in inserted],
-            provider=settings.llm_provider,
+            provider=settings.embedding_provider,
             model=settings.bigmodel_embedding_model,
             requested_at=now,
         )
 
     inserted_count = len(inserted)
-    return IngestBatchResponse(inserted=inserted_count, ignored=0, message_ids=[r[1] for r in inserted])
+    ignored_count = len(req.items) - inserted_count
+    return IngestBatchResponse(inserted=inserted_count, ignored=ignored_count, message_ids=[r[1] for r in inserted])

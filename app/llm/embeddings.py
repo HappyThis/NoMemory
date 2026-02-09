@@ -23,7 +23,7 @@ def _chunk(items: list[str], size: int) -> Iterable[list[str]]:
 
 
 def embed_query_text(text: str, *, provider: Optional[str] = None, model: Optional[str] = None) -> list[float]:
-    provider = provider or settings.llm_provider
+    provider = provider or settings.embedding_provider
     if provider != "bigmodel":
         raise ValueError(f"Unsupported embedding provider: {provider}")
     bm = BigModelClient()

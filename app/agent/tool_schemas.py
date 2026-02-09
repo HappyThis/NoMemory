@@ -10,12 +10,6 @@ class TimeRange(BaseModel):
     since: datetime | None = Field(default=None, description="ISO8601 datetime or null")
     until: datetime | None = Field(default=None, description="ISO8601 datetime or null")
 
-    @model_validator(mode="after")
-    def _require_one_bound(self) -> "TimeRange":
-        if self.since is None and self.until is None:
-            raise ValueError("time_range requires at least one of since/until")
-        return self
-
 
 class Filter(BaseModel):
     role: Literal["user", "assistant", "any"]
@@ -28,12 +22,6 @@ class MessagesListArgs(BaseModel):
     role: Literal["user", "assistant", "any"]
     page_size: int | None = None
     cursor: str | None = None
-
-    @model_validator(mode="after")
-    def _require_one_bound(self) -> "MessagesListArgs":
-        if self.since is None and self.until is None:
-            raise ValueError("messages_list requires at least one of since/until")
-        return self
 
 
 class LexicalSearchArgs(BaseModel):
@@ -118,17 +106,17 @@ def bigmodel_tool_schemas(*, allowed_tools: list[str]) -> list[dict[str, Any]]:
     schemas: dict[str, dict[str, Any]] = {
         "messages_list": _tool_schema(
             name="messages_list",
-            description="List messages by time range and role filter. role must be one of: user/assistant/any. Requires at least one of since/until.",
+            description="List messages by time range and role filter. role must be one of: user/assistant/any. If since/until are both null, treat as full time range.",
             model=MessagesListArgs,
         ),
         "lexical_search": _tool_schema(
             name="lexical_search",
-            description="Lexical search over messages with required filter.time_range and filter.role (user/assistant/any).",
+            description="Lexical search over messages with required filter.time_range and filter.role (user/assistant/any). If time_range.since/until are both null, treat as full time range.",
             model=LexicalSearchArgs,
         ),
         "semantic_search": _tool_schema(
             name="semantic_search",
-            description="Semantic search over messages with required filter.time_range and filter.role (user/assistant/any).",
+            description="Semantic search over messages with required filter.time_range and filter.role (user/assistant/any). If time_range.since/until are both null, treat as full time range.",
             model=SemanticSearchArgs,
         ),
         "neighbors": _tool_schema(

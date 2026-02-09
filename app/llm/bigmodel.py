@@ -6,20 +6,12 @@ from typing import Any, Optional
 import json
 import httpx
 
+from app.llm.errors import LLMError
 from app.settings import settings
 
 
-class BigModelError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int | None = None,
-        response_text: str | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.response_text = response_text
+class BigModelError(LLMError):
+    pass
 
 
 @dataclass(frozen=True)

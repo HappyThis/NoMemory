@@ -19,7 +19,15 @@ class Settings(BaseSettings):
 
     # LLM (agent reasoning) model selection
     llm_provider: str = "bigmodel"
-    llm_model: str = "glm-4.7-flash"
+    # NOTE: Prefer provider-specific model names below. Kept for backward compatibility.
+    llm_model: str = ""
+
+    # Provider-specific chat model names
+    bigmodel_llm_model: str = "glm-4.7-flash"
+    siliconflow_llm_model: str = "Pro/zai-org/GLM-4.7"
+
+    # Embeddings provider (can be different from llm_provider)
+    embedding_provider: str = "bigmodel"
 
     # BigModel (Zhipu) credentials/config. Endpoints are intentionally configurable so
     # the implementation can follow the latest vendor API without hard-coding URLs here.
@@ -29,6 +37,11 @@ class Settings(BaseSettings):
     bigmodel_embedding_model: str = "embedding-3"
     bigmodel_chat_timeout_sec: float = 180.0
     bigmodel_embedding_timeout_sec: float = 30.0
+
+    # SiliconFlow (OpenAI-compatible chat completions)
+    siliconflow_api_key: Optional[str] = None
+    siliconflow_chat_endpoint: str = "https://api.siliconflow.cn/v1/chat/completions"
+    siliconflow_chat_timeout_sec: float = 180.0
 
 
 settings = Settings()

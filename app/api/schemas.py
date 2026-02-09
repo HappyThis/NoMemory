@@ -34,6 +34,8 @@ class PaginatedMessages(BaseModel):
 
 
 class IngestMessage(BaseModel):
+    # Optional client-provided id for idempotent ingest.
+    message_id: Optional[str] = None
     ts: datetime
     role: Role
     content: str
