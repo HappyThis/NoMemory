@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from app.log import get_logger
@@ -32,7 +32,7 @@ from app.agent.tool_schemas import (
 )
 from app.utils.cursor import CursorError, decode_cursor, make_seek_cursor, parse_seek_anchor
 from app.utils.datetime import parse_datetime
-from app.db.models import Message
+from app.db.models import Message, MessageEmbedding
 
 
 logger = get_logger(__name__)
@@ -217,12 +217,14 @@ def _normalize_bigmodel_tool_args(args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _apply_tool_item_budget(obs: dict[str, Any], *, max_tool_items: int) -> dict[str, Any]:
+def _apply_tool_item_budget(obs: dict[str, Any], *, tool: str, max_tool_items: int) -> dict[str, Any]:
     """
     Hard constraint: prevent context explosion by truncating tool-returned `items` after the tool runs.
 
     - Do NOT clamp tool-call input params (we assume tool performance is OK).
-    - When truncating, sort by ts desc (latest first) then message_id desc.
+    - When truncating:
+      - For ranking-based tools (semantic_search/lexical_search) and neighbors, preserve tool order (take first N).
+      - For messages_list, sort by ts desc (latest first) then message_id desc.
     - Report total/returned counts and truncation reason back to the model via role=tool JSON.
     """
     items = obs.get("items")
@@ -242,8 +244,8 @@ def _apply_tool_item_budget(obs: dict[str, Any], *, max_tool_items: int) -> dict
         obs["returned_items"] = 0
         obs["truncated"] = total > 0
         obs["truncate_reason"] = "max_tool_items_non_positive" if total > 0 else None
-        obs["truncate_policy"] = "sort_by_ts_desc_message_id_desc_then_take_first"
-        obs["sort"] = "ts_desc_message_id_desc"
+        obs["truncate_policy"] = "tool_specific"
+        obs["sort"] = "n/a"
         obs["next_cursor"] = None
         obs["anchors"] = []
         return obs
@@ -254,33 +256,41 @@ def _apply_tool_item_budget(obs: dict[str, Any], *, max_tool_items: int) -> dict
         obs["truncated"] = False
         return obs
 
-    def _ts_key(x: Any) -> datetime:
-        ts = x.get("ts") if isinstance(x, dict) else None
-        if isinstance(ts, datetime):
-            return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
-        if isinstance(ts, str):
-            dt = parse_datetime(ts)
-            if isinstance(dt, datetime):
-                return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-        return datetime.min.replace(tzinfo=timezone.utc)
+    if tool in ("semantic_search", "lexical_search", "neighbors"):
+        trimmed = items[:max_tool_items]
+        obs["truncate_policy"] = "take_first_in_tool_order"
+        obs["sort"] = "tool_order"
+    else:
+        # Default for messages_list (and any other future time-based listing tools).
+        def _ts_key(x: Any) -> datetime:
+            ts = x.get("ts") if isinstance(x, dict) else None
+            if isinstance(ts, datetime):
+                return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+            if isinstance(ts, str):
+                dt = parse_datetime(ts)
+                if isinstance(dt, datetime):
+                    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+            return datetime.min.replace(tzinfo=timezone.utc)
 
-    def _id_key(x: Any) -> str:
-        if isinstance(x, dict):
-            v = x.get("message_id")
-            return "" if v is None else str(v)
-        return ""
+        def _id_key(x: Any) -> str:
+            if isinstance(x, dict):
+                v = x.get("message_id")
+                return "" if v is None else str(v)
+            return ""
 
-    sorted_items = sorted(items, key=lambda x: (_ts_key(x), _id_key(x)), reverse=True)
-    trimmed = sorted_items[:max_tool_items]
+        sorted_items = sorted(items, key=lambda x: (_ts_key(x), _id_key(x)), reverse=True)
+        trimmed = sorted_items[:max_tool_items]
+        obs["truncate_policy"] = "sort_by_ts_desc_message_id_desc_then_take_first"
+        obs["sort"] = "ts_desc_message_id_desc"
+
     obs["items"] = trimmed
     obs["returned_items"] = len(trimmed)
     obs["truncated"] = True
     obs["truncate_reason"] = "too_many_items_returned"
-    obs["truncate_policy"] = "sort_by_ts_desc_message_id_desc_then_take_first"
-    obs["sort"] = "ts_desc_message_id_desc"
     # Cursor ordering may no longer match after truncation; disable it to avoid misuse.
     obs["next_cursor"] = None
-    obs["anchors"] = [(str(it.get("message_id")), "latest_after_truncation") for it in trimmed[:3] if isinstance(it, dict) and it.get("message_id")]
+    why = "first_after_truncation" if tool in ("semantic_search", "lexical_search", "neighbors") else "latest_after_truncation"
+    obs["anchors"] = [(str(it.get("message_id")), why) for it in trimmed[:3] if isinstance(it, dict) and it.get("message_id")]
     return obs
 
 
@@ -453,6 +463,7 @@ class RecallAgent:
     def __init__(self, db: Session, *, user_id: str, skill_name: Optional[str] = None) -> None:
         self.db = db
         self.user_id = user_id
+        self._semantic_preflight_logged = False
         # Optional override to pin a specific skill; otherwise the LLM will select one
         # from the displayed skill list for this task.
         self.pinned_skill_id = skill_name
@@ -630,10 +641,21 @@ class RecallAgent:
             logger.debug("recall.loop state conversation_msgs=%s", len(conversation))
 
             allow_tools = iteration < settings.recall_max_iterations
+            # The model cannot otherwise "sense" the remaining iteration budget. Provide a lightweight
+            # runtime hint without persisting it in `conversation` (to avoid context bloat).
+            budget_hint = BigModelMessage(
+                role="system",
+                content=(
+                    f"RUNTIME_BUDGET: iter={iteration}/{settings.recall_max_iterations} "
+                    f"remaining={remaining} allow_tools={str(bool(allow_tools)).lower()}. "
+                    "If allow_tools=false, you MUST NOT return tool_calls and MUST output the final JSON now."
+                ),
+            )
+            prompt_messages = [*conversation, budget_hint]
             if allow_tools:
                 msg = client.chat_message(
                     model=get_chat_model(),
-                    messages=conversation,
+                    messages=prompt_messages,
                     temperature=0.2,
                     tools=_bigmodel_tool_schemas(self.defaults.allowed_tools),
                     tool_choice="auto",
@@ -641,7 +663,7 @@ class RecallAgent:
             else:
                 msg = client.chat_message(
                     model=get_chat_model(),
-                    messages=conversation,
+                    messages=prompt_messages,
                     temperature=0.2,
                 )
             content = msg.get("content")
@@ -775,7 +797,7 @@ class RecallAgent:
                         "items": [],
                         "error": {"type": "validation_error", "details": e.errors(include_url=False)[:3]},
                     }
-                obs = _apply_tool_item_budget(obs, max_tool_items=settings.recall_max_tool_items)
+                obs = _apply_tool_item_budget(obs, tool=tool, max_tool_items=settings.recall_max_tool_items)
                 logger.debug("recall.tool_result applied_limits=%s", obs.get("applied_limits"))
                 safe_obs = _make_observation_safe(obs)
                 logger.debug("recall.tool_exec_elapsed iter=%s tool=%s elapsed_ms=%s", iteration, tool, int((time.monotonic() - t1) * 1000))
@@ -920,6 +942,62 @@ class RecallAgent:
                     "role": role_val or "any",
                 }
                 return {"tool": tool, "items": [], "applied_limits": applied_limits}
+
+            # Preflight: verify embeddings exist for this user/provider/model before querying.
+            # This makes "returned_items=0" immediately explainable (embeddings not ready vs. score/filter).
+            try:
+                msg_where = [Message.user_id == self.user_id]
+                if role_dt:
+                    msg_where.append(Message.role == role_dt)
+                if since_dt:
+                    msg_where.append(Message.ts >= since_dt)
+                if until_dt:
+                    msg_where.append(Message.ts < until_dt)
+                msg_cnt = self.db.execute(select(func.count()).select_from(Message).where(*msg_where)).scalar_one()
+
+                emb_where = [
+                    MessageEmbedding.user_id == self.user_id,
+                    MessageEmbedding.provider == provider,
+                    MessageEmbedding.model == model,
+                ]
+                emb_cnt = self.db.execute(select(func.count()).select_from(MessageEmbedding).where(*emb_where)).scalar_one()
+
+                cand_where = list(emb_where)
+                if role_dt:
+                    cand_where.append(Message.role == role_dt)
+                if since_dt:
+                    cand_where.append(Message.ts >= since_dt)
+                if until_dt:
+                    cand_where.append(Message.ts < until_dt)
+                cand_cnt = self.db.execute(
+                    select(func.count())
+                    .select_from(MessageEmbedding)
+                    .join(
+                        Message,
+                        and_(
+                            MessageEmbedding.user_id == Message.user_id,
+                            MessageEmbedding.message_id == Message.message_id,
+                        ),
+                    )
+                    .where(*cand_where)
+                ).scalar_one()
+
+                if (not self._semantic_preflight_logged) or int(cand_cnt or 0) == 0:
+                    logger.info(
+                        "recall.semantic_preflight user_id=%s provider=%s model=%s messages=%s embeddings=%s candidates=%s role=%s since=%s until=%s",
+                        self.user_id,
+                        provider,
+                        model,
+                        int(msg_cnt or 0),
+                        int(emb_cnt or 0),
+                        int(cand_cnt or 0),
+                        role_val or "any",
+                        since_dt.isoformat() if since_dt else None,
+                        until_dt.isoformat() if until_dt else None,
+                    )
+                    self._semantic_preflight_logged = True
+            except Exception:
+                pass
 
             rows = semantic_search(
                 self.db,

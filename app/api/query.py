@@ -4,10 +4,12 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from app.api.schemas import (
     ChatMessage,
+    EmbeddingsStatusResponse,
     LexicalSearchRequest,
     NeighborsResponse,
     PaginatedMessages,
@@ -15,6 +17,7 @@ from app.api.schemas import (
     SemanticSearchRequest,
     SemanticSearchResponse,
 )
+from app.db.models import Message, MessageEmbedding
 from app.db.session import get_db
 from app.llm.bigmodel import BigModelError
 from app.llm.embeddings import embed_query_text
@@ -70,6 +73,69 @@ def messages_list(
         items = items[:page_size]
 
     return PaginatedMessages(items=[_to_msg(m) for m in items], next_cursor=next_cursor)
+
+
+@router.get("/users/{user_id}/embeddings/status", response_model=EmbeddingsStatusResponse)
+def embeddings_status(
+    user_id: str,
+    provider: Optional[str] = Query(default=None),
+    model: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+) -> EmbeddingsStatusResponse:
+    provider_val = provider or settings.embedding_provider
+    model_val = model or settings.bigmodel_embedding_model
+    enabled = bool(settings.bigmodel_api_key) and provider_val == "bigmodel"
+
+    messages = db.execute(select(func.count()).select_from(Message).where(Message.user_id == user_id)).scalar_one()
+    embeddings = db.execute(
+        select(func.count())
+        .select_from(MessageEmbedding)
+        .where(
+            MessageEmbedding.user_id == user_id,
+            MessageEmbedding.provider == provider_val,
+            MessageEmbedding.model == model_val,
+        )
+    ).scalar_one()
+
+    candidates = db.execute(
+        select(func.count())
+        .select_from(MessageEmbedding)
+        .join(
+            Message,
+            and_(
+                MessageEmbedding.user_id == Message.user_id,
+                MessageEmbedding.message_id == Message.message_id,
+            ),
+        )
+        .where(
+            MessageEmbedding.user_id == user_id,
+            MessageEmbedding.provider == provider_val,
+            MessageEmbedding.model == model_val,
+        )
+    ).scalar_one()
+
+    latest_row = db.execute(
+        select(MessageEmbedding.created_at)
+        .where(
+            MessageEmbedding.user_id == user_id,
+            MessageEmbedding.provider == provider_val,
+            MessageEmbedding.model == model_val,
+        )
+        .order_by(MessageEmbedding.created_at.desc())
+        .limit(1)
+    ).first()
+    latest = latest_row[0] if latest_row else None
+
+    return EmbeddingsStatusResponse(
+        user_id=user_id,
+        provider=str(provider_val),
+        model=str(model_val),
+        enabled=bool(enabled),
+        messages=int(messages or 0),
+        embeddings=int(embeddings or 0),
+        candidates=int(candidates or 0),
+        latest_embedding_at=latest,
+    )
 
 
 @router.post("/messages/lexical_search", response_model=PaginatedMessages)

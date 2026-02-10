@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from typing import Any
 
 import httpx
@@ -87,3 +89,32 @@ class SiliconFlowClient:
             msg["reasoning_content"] = msg.get("reasoning")
         return msg
 
+    def chat_json(self, *, messages: list[BigModelMessage], model: str, temperature: float = 0.0) -> dict[str, Any]:
+        """
+        Best-effort JSON mode (OpenAI-compatible).
+
+        Some providers support `response_format={"type":"json_object"}`. If not supported, callers can fall back to
+        parsing `chat_message(...).content`.
+        """
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": self._messages_payload(messages),
+            "temperature": temperature,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+        }
+        data = self._chat_raw(payload=payload)
+        choices = data.get("choices") or []
+        if not choices:
+            raise SiliconFlowError("No choices in chat response")
+        msg = choices[0].get("message") or {}
+        content = msg.get("content")
+        if not isinstance(content, str):
+            raise SiliconFlowError("Invalid chat response content")
+        try:
+            obj = json.loads(content)
+        except Exception as e:
+            raise SiliconFlowError("Invalid JSON output in JSON mode") from e
+        if not isinstance(obj, dict):
+            raise SiliconFlowError("Expected JSON object output in JSON mode")
+        return obj

@@ -80,6 +80,17 @@ class SemanticSearchResponse(BaseModel):
     items: list[SemanticMessage]
 
 
+class EmbeddingsStatusResponse(BaseModel):
+    user_id: str
+    provider: str
+    model: str
+    enabled: bool
+    messages: int
+    embeddings: int
+    candidates: int
+    latest_embedding_at: Optional[datetime] = None
+
+
 class NeighborsResponse(BaseModel):
     items: list[ChatMessage]
 
@@ -103,3 +114,19 @@ class LocomoQARequest(BaseModel):
 class LocomoQAResponse(BaseModel):
     answer: str = Field(default="")
     evidence: list[ChatMessage] = Field(default_factory=list)
+
+
+LocomoJudgeLabel = Literal["CORRECT", "WRONG"]
+
+
+class LocomoJudgeRequest(BaseModel):
+    question: str = Field(min_length=1)
+    gold_answer: Optional[Any] = None
+    pred_answer: str = Field(default="")
+    category: Optional[int] = None
+    now: Optional[datetime] = None
+
+
+class LocomoJudgeResponse(BaseModel):
+    label: LocomoJudgeLabel
+    reason: Optional[str] = None

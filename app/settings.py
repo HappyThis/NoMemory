@@ -8,6 +8,7 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
     log_format: str = "json"  # json/text
+    log_file: Optional[str] = None
 
     database_url: str = "postgresql+psycopg://nomemory:nomemory@127.0.0.1:5432/nomemory"
     cursor_secret: str = "dev-insecure"
