@@ -11,11 +11,15 @@ description: LoCoMo QA 基准适配：基于检索工具召回证据，并在同
 
 禁止：编造对话中不存在的事实。若无法从证据中回答，必须输出固定字符串 **`"unknown"`**。
 
-## 核心目标（Judge 优先）
+## 核心目标（记忆效果优先）
 
-本 skill 的首要目标是：**尽量不要因为“检索方式不当/太早放弃”而输出 `unknown`**。
+本 skill 的首要目标是：**基于证据给出尽可能准确的答案**。
 
-在非 Adversarial 问题中，`unknown` 往往会直接导致 judge=WRONG。你应当充分发挥大模型的判断力：
+`unknown` 本身不是坏事：当证据确实不足或冲突无法裁决时，输出 `unknown` 是高质量、诚实的记忆行为。
+
+本 skill 真正要避免的是：**明明有证据可以找/可以支撑合理推断，但因为“检索方式不当/太早放弃/工具用法错误”而输出 `unknown`**。
+
+你应当充分发挥大模型的判断力：
 - 先尽可能找到证据（允许改写 query、换工具、换角度）
 - 再基于证据做受约束推断（Yes/No/Likely 等）
 - 只有在确实缺证据/证据矛盾无法裁决时，才输出 `unknown`
@@ -33,13 +37,17 @@ description: LoCoMo QA 基准适配：基于检索工具召回证据，并在同
   - 或者证据互相矛盾，无法合理裁决；
   - 或者问题要求一个具体事实（时间/地点/数值/名字）但证据缺失。
 
-示例（仅示意风格）：
-- Q: Would Caroline likely have Dr. Seuss books on her bookshelf?
-  - Evidence: “lots of kids' books — classics …”
-  - A: `Yes, since she collects classic children's books`
-- Q: Would Melanie be considered a member of the LGBTQ community?
-  - Evidence: 她支持/是 ally，但没有自我身份表述
-  - A: `Likely no, she does not refer to herself as part of it`
+示例（虚构，用于说明风格；不来自任何评测集/数据集）：
+
+- Q: 阿洛恩出门时会不会随身带“蓝环杯”？
+  - Evidence: “我现在每天出门都会把蓝环杯装满放进包里。”
+  - A: `Yes, since they say they bring it every day when going out`
+- Q: 比娜尔接下来可能会不会换城市工作？
+  - Evidence: “我挺喜欢现在的团队，但也在看外地的机会，想多比较一下。”
+  - A: `Likely yes, since they mention considering opportunities in another city`
+- Q: 迟栖最喜欢的天体是什么？
+  - Evidence: 没有任何相关提及
+  - A: `unknown`
 
 ## 检索策略（建议）
 
@@ -50,18 +58,18 @@ description: LoCoMo QA 基准适配：基于检索工具召回证据，并在同
 ### 0) 先做解析（1 次迭代内完成）
 
 把问题拆成这 3 个要素（写在思考里，不要出现在最终 JSON）：
-- 主体：人/物/地点/事件（通常是人名，如 John/Joanna/Caroline/James…）
+- 主体：人/物/地点/事件（例如：人名、物品名、地点名、某次活动）
 - 目标：要找的事实类型（时间/数量/地点/身份/偏好/是否/可能性）
-- 约束：时间窗口（during April 2022 / last week / this year / when…）、角色（谁说的）等
+ - 约束：时间窗口（during April 2022 / last week / this year / when…）、角色（谁说的）等
 
 然后生成“关键词集合”：
-- 精确关键词：人名、专有名词（UNO、Voyageurs、Paris…）、月份/年份（April 2022、2023…）、数字（4/four）
+- 精确关键词：人名/专有名词（例如：地点名、组织名、物品名）、时间表达（例如：月份/年份）、数字（例如：数字/文字数字）
 - 语义关键词：同义词/改写（girlfriend/partner/dating；live in/reside；moved/relocated…）
 - 判断题关键词：likely / would / open to / want to / plan to / considering / prefer 等
 
 同时确定默认过滤策略（很关键，但不限制你的自由发挥）：
 - **默认 role=any**：除非问题明确限定“谁说的/某一方的发言”，否则不建议用 role=user/assistant 过滤（容易漏证据）
-- `time_range` 过滤的是**消息发送时间（message.ts）**，不是“事件发生时间”。例如问题问 *summer 2021*，相关证据可能出现在 2023 的回忆消息里
+- `time_range` 过滤的是**消息发送时间（message.ts）**，不是“事件发生时间”。例如问题里出现 `<EVENT_TIME>`，相关证据也可能出现在更晚的回忆消息里
 
 ### 1) 词法检索优先（lexical_search）
 
@@ -72,8 +80,8 @@ description: LoCoMo QA 基准适配：基于检索工具召回证据，并在同
 2) 同义改写组合（把目标换成同义词或更常见的词）
 
 如果问题涉及数字/次数：
-- 同时检索数字与英文（`4` 和 `four`；`two`/`2`）
-- 如果是 “how many …” 也检索 `times` / `once` / `twice` / `several`
+- 同时考虑“数字形式”和“文字形式”（例如：`4` 与 `four`）
+- 对“计数类问题”，也考虑常见计数表达（例如：times/once/twice/several）
 
 如果 lexical_search 返回 0 项，通常应切换到 semantic_search（或改写 query 再试一次）。
 
@@ -100,7 +108,7 @@ description: LoCoMo QA 基准适配：基于检索工具召回证据，并在同
   - 用较小 `page_size`（例如 20–50，且 `<= max_tool_items`）避免触发截断
   - 用 `next_cursor` 继续向更早的消息翻页（建议控制页数，别无限翻）
 
-注意：不要把问题里的“事件时间”（summer 2021 / April 2022）直接当成 messages_list 的 since/until；它们描述的是事件发生时间，不等于 message.ts。
+注意：不要把问题里的“事件时间”（例如：`<EVENT_TIME>`）直接当成 messages_list 的 since/until；它们描述的是事件发生时间，不等于 message.ts。
 
 扫读时要找两类句子：
 - 明确事实句（time/place/number/name）
@@ -114,6 +122,15 @@ description: LoCoMo QA 基准适配：基于检索工具召回证据，并在同
 - 如果是“具体事实题”（时间/地点/数量/名字/物品），而你经过若干次有效检索仍找不到任何相关证据：输出 `unknown`
 - 如果是“判断/可能性题”（would/likely/open to/want to），只要有证据能支持倾向：优先给 **Likely yes / Likely no / Probably / Unclear but likely...** 的短判断；不要因为缺少 100% 确定句就直接 unknown
 - 如果证据互相矛盾且无法合理裁决：输出 `unknown`
+
+## 常见卡住点（温和建议）
+
+这部分不是“硬规则”，只是一些经常能显著改善记忆效果的思路：
+
+- 检索命中“很泛/很空”：优先改写 query，加入更具体的约束词（人名、专有名词、关键词组合），或换工具（lexical ↔ semantic）。
+- “推断/可能性”类问题：不要执着于检索目标标签本身（比如学历/职业/收入这类标签），更有效的是去检索**支撑推断的线索**（plans/goals/values/activities/constraints），再在 neighbors 里找直接证据句。
+- 扫读时反复只看到最新消息：说明你在全时间范围下没有分页/或触发截断。把 `page_size` 降到 `<= max_tool_items`，并用 `next_cursor` 继续向更早翻页。
+- 搜索完全没结果但你确信对话里“应该提过”：把关键词改写成更口语/更常见的同义表达，或从相关实体反推（比如先找人名/物品名，再用 neighbors 看上下文）。
 
 ## NOW（时间锚点）
 
@@ -147,6 +164,7 @@ description: LoCoMo QA 基准适配：基于检索工具召回证据，并在同
 注意：
 - **拿不准、且允许不填的参数就不要填写**（例如 `until`、`min_score`、`before/after` 等）；让运行时默认值接管。
 - `cursor` 只在你要“继续翻页”时使用：把上一次工具返回的 `next_cursor` 原样传回去即可。
+- 对于可选时间字段：要么省略字段、要么使用 JSON 的 `null`；**不要**传字符串 `"None"` / `"null"`（会触发校验错误，导致工具返回为空）。
 - 对于时间字段（`since/until`）：只允许 ISO8601 时间字符串，或直接**省略该字段**；不要使用字符串 `"null"` 作为占位。
 
 ## 截断处理（必须遵守）

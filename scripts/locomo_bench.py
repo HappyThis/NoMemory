@@ -11,7 +11,6 @@ import random
 import string
 import sys
 import time
-import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -19,6 +18,9 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import httpx
+
+DEFAULT_LOCOMO_URL = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
+FIXED_USER_PREFIX = "locomo"
 
 
 def _now_utc() -> datetime:
@@ -316,30 +318,29 @@ def _get_json(
     return r.json()
 
 
-def _wait_for_embeddings(client: httpx.Client, *, user_id: str, expected: int, timeout_sec: float) -> None:
-    if expected <= 0:
-        return
+def _wait_for_embeddings(client: httpx.Client, *, user_id: str) -> None:
     t0 = time.monotonic()
     sleep_s = 0.25
     last_emb = -1
+    last_msgs = -1
     while True:
         status = _get_json(client, f"/v1/users/{user_id}/embeddings/status")
         enabled = bool(status.get("enabled"))
+        msgs = int(status.get("messages") or 0)
         emb = int(status.get("embeddings") or 0)
         if not enabled:
             return
-        if emb >= expected:
+        if msgs <= 0:
+            return
+        if emb >= msgs:
             return
 
         elapsed = time.monotonic() - t0
-        if elapsed >= float(timeout_sec):
-            raise TimeoutError(
-                f"embeddings_not_ready user_id={user_id} embeddings={emb} expected>={expected} timeout_sec={timeout_sec}"
-            )
 
-        if emb != last_emb:
+        if emb != last_emb or msgs != last_msgs:
             last_emb = emb
-            print(f"wait embeddings user_id={user_id} embeddings={emb}/{expected} elapsed={_fmt_eta(elapsed)}")
+            last_msgs = msgs
+            print(f"wait embeddings user_id={user_id} embeddings={emb}/{msgs} elapsed={_fmt_eta(elapsed)}")
         time.sleep(sleep_s)
         sleep_s = min(2.0, sleep_s * 1.5)
 
@@ -350,28 +351,10 @@ async def _post_json_async(
     *,
     headers: dict[str, str] | None = None,
     payload: dict[str, Any],
-    max_retries: int,
-    backoff_sec: float,
 ) -> Any:
-    last_err: Exception | None = None
-    for attempt in range(max_retries + 1):
-        try:
-            r = await client.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            return r.json()
-        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as e:
-            last_err = e
-            status = None
-            if isinstance(e, httpx.HTTPStatusError):
-                status = e.response.status_code
-            retryable = status in (429, 502, 503, 504) or status is None
-            if not retryable or attempt >= max_retries:
-                raise
-            sleep_s = float(backoff_sec) * (2**attempt) * (0.5 + random.random())
-            await asyncio.sleep(sleep_s)
-    if last_err is not None:
-        raise last_err
-    raise RuntimeError("unreachable")
+    r = await client.post(url, headers=headers, json=payload)
+    r.raise_for_status()
+    return r.json()
 
 
 def _safe_load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -391,13 +374,64 @@ def _safe_load_jsonl(path: Path) -> list[dict[str, Any]]:
     return out
 
 
-def _completed_keys_from_predictions(path: Path) -> set[tuple[str, int]]:
+def _parse_metrics_arg(v: Any) -> set[str]:
+    """
+    Parse --metrics.
+
+    Supported:
+      - f1: token-level F1
+      - llm: LLM-as-judge (requires /v1/bench/locomo/judge)
+    """
+    if v is None:
+        return {"f1"}
+    parts = re.split(r"[,\s]+", str(v))
+    metrics: set[str] = set()
+    for p in parts:
+        s = p.strip().lower()
+        if not s:
+            continue
+        if s in ("judge", "llm_judge", "llm-as-judge", "llm_as_judge"):
+            s = "llm"
+        metrics.add(s)
+    if not metrics:
+        metrics = {"f1"}
+    allowed = {"f1", "llm"}
+    unknown = sorted(m for m in metrics if m not in allowed)
+    if unknown:
+        raise ValueError(f"--metrics invalid: {unknown} (allowed: f1,llm)")
+    return metrics
+
+
+def _row_has_required_metrics(obj: dict[str, Any], *, required: set[str]) -> bool:
+    err = obj.get("error")
+    if err is not None and (not isinstance(err, str) or err.strip()):
+        return False
+
+    if "f1" in required and "f1" not in obj:
+        return False
+
+    if "llm" in required:
+        label = obj.get("judge_label")
+        score = obj.get("judge_score")
+        if isinstance(score, bool):
+            return True
+        if isinstance(score, int) and score in (0, 1):
+            return (label in (None, "CORRECT", "WRONG")) if label is not None else True
+        if isinstance(score, float) and score in (0.0, 1.0):
+            return (label in (None, "CORRECT", "WRONG")) if label is not None else True
+        return False
+
+    return True
+
+
+def _completed_keys_from_predictions(path: Path, *, required_metrics: set[str]) -> set[tuple[str, int]]:
     done: set[tuple[str, int]] = set()
     for obj in _safe_load_jsonl(path):
         sample_id = obj.get("sample_id")
         qa_idx = obj.get("qa_idx")
         if isinstance(sample_id, str) and isinstance(qa_idx, int):
-            done.add((sample_id, qa_idx))
+            if _row_has_required_metrics(obj, required=required_metrics):
+                done.add((sample_id, qa_idx))
     return done
 
 
@@ -424,20 +458,27 @@ def _parse_only_category_arg(v: str | None) -> int | None:
     if not s:
         return None
     mapping = {
+        # LoCoMo category ids in locomo10.json follow the repository evaluation code, not the paper's numbered list:
+        #   1=Multi-hop, 2=Temporal, 3=Open-domain, 4=Single-hop, 5=Adversarial
         "1": 1,
-        "single": 1,
-        "single-hop": 1,
-        "singlehop": 1,
+        "multi": 1,
+        "multi-hop": 1,
+        "multihop": 1,
         "2": 2,
-        "multi": 2,
-        "multi-hop": 2,
-        "multihop": 2,
+        "temporal": 2,
+        "time": 2,
         "3": 3,
-        "temporal": 3,
-        "time": 3,
+        "open": 3,
+        "open-domain": 3,
+        "open_domain": 3,
+        "opendomain": 3,
+        # Some write-ups refer to this bucket as "open-domain/commonsense".
+        "commonsense": 3,
+        "common-sense": 3,
         "4": 4,
-        "commonsense": 4,
-        "common-sense": 4,
+        "single": 4,
+        "single-hop": 4,
+        "singlehop": 4,
         "5": 5,
         "adversarial": 5,
         "adv": 5,
@@ -451,74 +492,35 @@ def _parse_only_category_arg(v: str | None) -> int | None:
 
 
 _CATEGORY_LABELS: dict[int, str] = {
-    1: "Single-hop",
-    2: "Multi-hop",
-    3: "Temporal",
-    4: "Commonsense",
+    1: "Multi-hop",
+    2: "Temporal",
+    3: "Open-domain",
+    4: "Single-hop",
     5: "Adversarial",
 }
 
-
-def _category_label(v: Any) -> str:
-    cat = _parse_category_1_5(v)
-    if cat is None:
-        return str(v)
-    return _CATEGORY_LABELS.get(cat, str(cat))
-
-
-def _has_gold_answer(gold: Any) -> bool:
-    if gold is None:
-        return False
-    if isinstance(gold, str):
-        return bool(gold.strip())
-    if isinstance(gold, list):
-        for g in gold:
-            if isinstance(g, str) and g.strip():
-                return True
-        return False
-    return True
-
+_EVALUATED_CATEGORY_IDS: tuple[int, ...] = (1, 2, 3, 4)
 
 def _score_f1(*, pred_answer: str, gold_answer: Any, category: Any) -> Optional[float]:
     """
-    LoCoMo F1 with a special rule for Adversarial (category=5):
-      - If gold exists: score as normal.
-      - If gold is missing: pred=="unknown" => 1.0 else 0.0
+    Token-level F1 against LoCoMo gold answers.
+
+    Note: Adversarial questions (category=5) are not evaluated by this runner.
     """
-    cat = _parse_category_1_5(category)
-    if cat == 5 and not _has_gold_answer(gold_answer):
-        return 1.0 if pred_answer.strip().lower() == "unknown" else 0.0
     return _max_f1(pred_answer, gold_answer)
 
 
-def _f1_value_or_zero(v: Any) -> float:
-    return float(v) if isinstance(v, (int, float)) else 0.0
-
-
-def _row_f1_value(obj: dict[str, Any]) -> float:
-    f1 = obj.get("f1")
-    if isinstance(f1, (int, float)) and math.isfinite(float(f1)):
-        return float(f1)
-    pred = obj.get("pred_answer")
-    if not isinstance(pred, str):
-        pred = str(pred or "")
-    gold = obj.get("gold_answer")
-    cat = obj.get("category")
-    scored = _score_f1(pred_answer=pred, gold_answer=gold, category=cat)
-    return float(scored) if isinstance(scored, (int, float)) and math.isfinite(float(scored)) else 0.0
-
-
 def _new_cat_sums() -> dict[int, float]:
-    return {i: 0.0 for i in range(1, 6)}
+    return {i: 0.0 for i in _EVALUATED_CATEGORY_IDS}
 
 
 def _new_cat_counts() -> dict[int, int]:
-    return {i: 0 for i in range(1, 6)}
+    return {i: 0 for i in _EVALUATED_CATEGORY_IDS}
 
 
 def _fmt_cat_f1_means(cat_sum: dict[int, float], cat_cnt: dict[int, int]) -> str:
     parts: list[str] = []
-    for i in range(1, 6):
+    for i in _EVALUATED_CATEGORY_IDS:
         cnt = int(cat_cnt.get(i) or 0)
         mean = (float(cat_sum.get(i) or 0.0) / cnt) if cnt > 0 else 0.0
         parts.append(f"{_CATEGORY_LABELS.get(i, str(i))}={mean:.3f}")
@@ -527,7 +529,7 @@ def _fmt_cat_f1_means(cat_sum: dict[int, float], cat_cnt: dict[int, int]) -> str
 
 def _fmt_cat_judge_means(judge_sum: dict[int, float], judge_cnt: dict[int, int]) -> str:
     parts: list[str] = []
-    for i in range(1, 6):
+    for i in _EVALUATED_CATEGORY_IDS:
         cnt = int(judge_cnt.get(i) or 0)
         mean = (float(judge_sum.get(i) or 0.0) / cnt) if cnt > 0 else 0.0
         parts.append(f"{_CATEGORY_LABELS.get(i, str(i))}={mean:.3f}")
@@ -536,9 +538,9 @@ def _fmt_cat_judge_means(judge_sum: dict[int, float], judge_cnt: dict[int, int])
 
 def _cat_f1_totals_from_predictions(path: Path) -> tuple[dict[int, float], dict[int, int]]:
     """
-    Build run-level category (1..5) F1 sum/count from predictions.jsonl.
+    Build run-level category (1..4) F1 sum/count from predictions.jsonl.
 
-    If a row has f1==null/missing, it is treated as 0 for aggregation.
+    If a row has f1==null/missing, it is treated as 0 for aggregation (no recomputation).
     If there are duplicate (sample_id, qa_idx) rows, the last one wins.
     """
     by_key: dict[tuple[str, int], tuple[int, float]] = {}
@@ -548,9 +550,10 @@ def _cat_f1_totals_from_predictions(path: Path) -> tuple[dict[int, float], dict[
         if not (isinstance(sample_id, str) and isinstance(qa_idx, int)):
             continue
         cat = _parse_category_1_5(obj.get("category"))
-        if cat is None:
+        if cat not in _EVALUATED_CATEGORY_IDS:
             continue
-        f1 = _row_f1_value(obj)
+        f1v = obj.get("f1")
+        f1 = float(f1v) if isinstance(f1v, (int, float)) and math.isfinite(float(f1v)) else 0.0
         by_key[(sample_id, qa_idx)] = (cat, f1)
 
     cat_sum = _new_cat_sums()
@@ -563,7 +566,7 @@ def _cat_f1_totals_from_predictions(path: Path) -> tuple[dict[int, float], dict[
 
 def _cat_judge_totals_from_predictions(path: Path) -> tuple[dict[int, float], dict[int, int]]:
     """
-    Build run-level category (1..5) judge score sum/count from predictions.jsonl.
+    Build run-level category (1..4) judge score sum/count from predictions.jsonl.
 
     - Rows without judge fields are excluded.
     - If there are duplicate (sample_id, qa_idx) rows, the last one wins.
@@ -575,7 +578,7 @@ def _cat_judge_totals_from_predictions(path: Path) -> tuple[dict[int, float], di
         if not (isinstance(sample_id, str) and isinstance(qa_idx, int)):
             continue
         cat = _parse_category_1_5(obj.get("category"))
-        if cat is None:
+        if cat not in _EVALUATED_CATEGORY_IDS:
             continue
         score = obj.get("judge_score")
         if isinstance(score, bool):
@@ -594,186 +597,6 @@ def _cat_judge_totals_from_predictions(path: Path) -> tuple[dict[int, float], di
         cat_sum[cat] += float(score)
         cat_cnt[cat] += 1
     return cat_sum, cat_cnt
-
-
-def _backfill_missing_judge(
-    *,
-    preds_path: Path,
-    base_url: str,
-    max_retries: int,
-    backoff_sec: float,
-    concurrency: int,
-    progress_every: int = 50,
-) -> int:
-    """
-    Rewrite predictions.jsonl in-place, adding judge_* fields for rows that don't have them.
-
-    Requires the service to expose POST /v1/bench/locomo/judge.
-    Returns the number of updated rows.
-    """
-    if not preds_path.exists():
-        return 0
-    conc = max(1, int(concurrency))
-
-    raws = preds_path.read_text(encoding="utf-8").splitlines()
-    if not raws:
-        return 0
-
-    records: list[tuple[str, Any]] = []
-    for raw in raws:
-        line = raw.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            records.append(("raw", raw.rstrip("\n")))
-            continue
-        if not isinstance(obj, dict):
-            records.append(("raw", raw.rstrip("\n")))
-            continue
-        records.append(("obj", obj))
-
-    todo: list[tuple[int, dict[str, Any]]] = []
-    for idx, (kind, val) in enumerate(records):
-        if kind != "obj":
-            continue
-        obj = val
-        if obj.get("judge_label") in ("CORRECT", "WRONG") and isinstance(obj.get("judge_score"), (int, float, bool)):
-            continue
-        q = obj.get("question")
-        pred = obj.get("pred_answer")
-        if not isinstance(q, str) or not q.strip():
-            continue
-        if not isinstance(pred, str):
-            pred = str(pred or "")
-        payload = {
-            "question": q,
-            "gold_answer": obj.get("gold_answer"),
-            "pred_answer": pred,
-            "category": _parse_category_1_5(obj.get("category")),
-            "now": obj.get("now"),
-        }
-        todo.append((idx, payload))
-
-    if not todo:
-        return 0
-
-    async def _run() -> dict[int, tuple[str, int, str | None]]:
-        results: dict[int, tuple[str, int, str | None]] = {}
-        q: asyncio.Queue[tuple[int, dict[str, Any]] | None] = asyncio.Queue()
-        for it in todo:
-            q.put_nowait(it)
-        for _ in range(conc):
-            q.put_nowait(None)
-
-        fatal_evt = asyncio.Event()
-        fatal_err: Exception | None = None
-        updated_local = 0
-        lock = asyncio.Lock()
-
-        async with httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(180.0)) as client:
-
-            async def worker() -> None:
-                nonlocal fatal_err, updated_local
-                while True:
-                    if fatal_evt.is_set():
-                        return
-                    item = await q.get()
-                    if item is None:
-                        q.task_done()
-                        return
-                    rec_idx, payload = item
-                    try:
-                        resp = await _post_json_async(
-                            client,
-                            "/v1/bench/locomo/judge",
-                            payload=payload,
-                            max_retries=max_retries,
-                            backoff_sec=backoff_sec,
-                        )
-                        if not isinstance(resp, dict):
-                            raise RuntimeError(f"invalid judge response: {resp!r}")
-                        label = resp.get("label")
-                        if label not in ("CORRECT", "WRONG"):
-                            raise RuntimeError(f"invalid judge label: {label!r}")
-                        score = 1 if label == "CORRECT" else 0
-                        reason = resp.get("reason")
-                        reason_s = reason.strip() if isinstance(reason, str) and reason.strip() else None
-                        async with lock:
-                            results[rec_idx] = (label, score, reason_s)
-                            updated_local += 1
-                            if progress_every and updated_local % int(progress_every) == 0:
-                                print(f"judge backfill updated={updated_local}/{len(todo)} file={preds_path}")
-                    except Exception as e:
-                        if not fatal_evt.is_set():
-                            fatal_err = e
-                            fatal_evt.set()
-                        q.task_done()
-                        return
-                    q.task_done()
-
-            workers = [asyncio.create_task(worker()) for _ in range(conc)]
-            join_task = asyncio.create_task(q.join())
-            fatal_wait = asyncio.create_task(fatal_evt.wait())
-            done, pending = await asyncio.wait({join_task, fatal_wait}, return_when=asyncio.FIRST_COMPLETED)
-
-            if fatal_evt.is_set():
-                for t in pending:
-                    t.cancel()
-                for w in workers:
-                    w.cancel()
-                await asyncio.gather(*workers, return_exceptions=True)
-                raise RuntimeError(f"judge_backfill_failed updated={len(results)}/{len(todo)} err={fatal_err}") from fatal_err
-
-            for t in pending:
-                t.cancel()
-            for w in workers:
-                await w
-        return results
-
-    results = asyncio.run(_run()) if conc > 1 else None
-
-    # Fallback to sequential mode if requested.
-    if conc <= 1:
-        results = {}
-        with httpx.Client(base_url=base_url, timeout=180.0) as client:
-            for k, payload in todo:
-                resp_obj = _post_json(client, "/v1/bench/locomo/judge", payload=payload)
-                if not isinstance(resp_obj, dict):
-                    raise RuntimeError(f"invalid judge response: {resp_obj!r}")
-                label = resp_obj.get("label")
-                if label not in ("CORRECT", "WRONG"):
-                    raise RuntimeError(f"invalid judge label: {label!r}")
-                score = 1 if label == "CORRECT" else 0
-                reason = resp_obj.get("reason")
-                reason_s = reason.strip() if isinstance(reason, str) and reason.strip() else None
-                results[k] = (label, score, reason_s)
-
-    tmp = preds_path.with_suffix(preds_path.suffix + ".tmp")
-    bak = preds_path.with_suffix(preds_path.suffix + f".bak.{_now_utc().strftime('%Y%m%dT%H%M%SZ')}")
-    updated = 0
-    with tmp.open("w", encoding="utf-8") as out:
-        for idx, (kind, val) in enumerate(records):
-            if kind == "raw":
-                out.write(str(val).rstrip("\n") + "\n")
-                continue
-            obj = val
-            r = results.get(idx)
-            if r is not None:
-                label, score, reason = r
-                obj["judge_label"] = label
-                obj["judge_score"] = score
-                if reason:
-                    obj["judge_reason"] = reason
-                updated += 1
-            out.write(json.dumps(obj, ensure_ascii=False) + "\n")
-
-    shutil.copy2(preds_path, bak)
-    tmp.replace(preds_path)
-    if updated:
-        print(f"judge backfill done updated={updated} total_missing={len(todo)} file={preds_path} concurrency={conc}")
-    return updated
 
 
 def _cleanup_prediction_errors(*, preds_path: Path) -> int:
@@ -815,24 +638,70 @@ def _cleanup_prediction_errors(*, preds_path: Path) -> int:
 
 
 def _compute_summary_from_predictions(*, preds_path: Path, run_id: str, base_url: str, samples: int) -> dict[str, Any]:
+    # Deduplicate by (sample_id, qa_idx); last row wins (important for resume).
+    by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    for obj in _safe_load_jsonl(preds_path):
+        sample_id = obj.get("sample_id")
+        qa_idx = obj.get("qa_idx")
+        if isinstance(sample_id, str) and isinstance(qa_idx, int):
+            by_key[(sample_id, qa_idx)] = obj
+
+    # If there are migrated error rows (resume moved them out for retry) but they haven't been
+    # successfully re-run yet, include them in the denominator as incorrect.
+    errors_path = preds_path.with_name("predictions.errors.jsonl")
+    if errors_path.exists():
+        for obj in _safe_load_jsonl(errors_path):
+            sample_id = obj.get("sample_id")
+            qa_idx = obj.get("qa_idx")
+            if isinstance(sample_id, str) and isinstance(qa_idx, int):
+                by_key.setdefault((sample_id, qa_idx), obj)
+
     f1_by_cat: dict[str, list[float]] = defaultdict(list)
     judge_by_cat: dict[str, list[float]] = defaultdict(list)
     total = 0
-    scored = 0
+    error_rows = 0
+    f1_scored = 0
     judge_scored = 0
-    for obj in _safe_load_jsonl(preds_path):
+
+    f1_enabled = any("f1" in obj for obj in by_key.values())
+    judge_enabled = any(
+        ("judge_score" in obj) or ("judge_label" in obj) or ("judge_reason" in obj) or ("judge_request_id" in obj)
+        for obj in by_key.values()
+    )
+
+    for obj in by_key.values():
+        cat_i = _parse_category_1_5(obj.get("category"))
+        if cat_i not in _EVALUATED_CATEGORY_IDS:
+            continue
         total += 1
-        cat = _category_label(obj.get("category"))
-        f1 = obj.get("f1")
-        if isinstance(f1, (int, float)):
-            scored += 1
-        f1_by_cat[cat].append(_row_f1_value(obj))
-        js = obj.get("judge_score")
-        if isinstance(js, bool):
-            js = 1.0 if js else 0.0
-        if isinstance(js, (int, float)) and math.isfinite(float(js)):
-            judge_scored += 1
-            judge_by_cat[cat].append(float(js))
+        cat = _CATEGORY_LABELS.get(cat_i, str(cat_i))
+
+        err = obj.get("error")
+        if err is not None:
+            if not isinstance(err, str):
+                error_rows += 1
+            elif err.strip():
+                error_rows += 1
+
+        if f1_enabled:
+            f1v = obj.get("f1") if "f1" in obj else None
+            if isinstance(f1v, (int, float)) and math.isfinite(float(f1v)):
+                f1_scored += 1
+                f1_by_cat[cat].append(float(f1v))
+            else:
+                # Treat missing / invalid / errored rows as incorrect (0.0) in the denominator.
+                f1_by_cat[cat].append(0.0)
+
+        if judge_enabled:
+            js = obj.get("judge_score")
+            if isinstance(js, bool):
+                js = 1.0 if js else 0.0
+            if isinstance(js, (int, float)) and math.isfinite(float(js)):
+                judge_scored += 1
+                judge_by_cat[cat].append(float(js))
+            else:
+                # Treat missing / invalid / errored rows as incorrect (0.0) in the denominator.
+                judge_by_cat[cat].append(0.0)
 
     def _mean(xs: list[float]) -> float:
         return sum(xs) / len(xs) if xs else 0.0
@@ -841,17 +710,27 @@ def _compute_summary_from_predictions(*, preds_path: Path, run_id: str, base_url
     def _sort_key(k: str) -> tuple[int, str]:
         return (label_order.get(k, 999), k)
 
+    f1_total = total if f1_enabled else 0
+    judge_total = total if judge_enabled else 0
+
     return {
         "run_id": run_id,
         "base_url": base_url,
         "samples": samples,
         "qa_total": total,
-        "qa_scored": scored,
-        "f1_mean": _mean([x for xs in f1_by_cat.values() for x in xs]),
-        "f1_by_category": {k: {"count": len(v), "mean": _mean(v)} for (k, v) in sorted(f1_by_cat.items(), key=lambda kv: _sort_key(kv[0]))},
+        "qa_errors": error_rows,
+        "qa_error_rate": (error_rows / total if total else 0.0),
+        "qa_scored": f1_scored,
+        "f1_total": f1_total,
+        "f1_scored": f1_scored,
+        "f1_mean": (_mean([x for xs in f1_by_cat.values() for x in xs]) if f1_by_cat else None),
+        "f1_by_category": ({k: {"count": len(v), "mean": _mean(v)} for (k, v) in sorted(f1_by_cat.items(), key=lambda kv: _sort_key(kv[0]))} if f1_by_cat else None),
+        "f1_missing": (f1_total - f1_scored) if f1_enabled else None,
+        "judge_total": judge_total,
         "judge_scored": judge_scored,
-        "judge_mean": _mean([x for xs in judge_by_cat.values() for x in xs]),
-        "judge_by_category": {k: {"count": len(v), "mean": _mean(v)} for (k, v) in sorted(judge_by_cat.items(), key=lambda kv: _sort_key(kv[0]))},
+        "judge_mean": (_mean([x for xs in judge_by_cat.values() for x in xs]) if judge_by_cat else None),
+        "judge_by_category": ({k: {"count": len(v), "mean": _mean(v)} for (k, v) in sorted(judge_by_cat.items(), key=lambda kv: _sort_key(kv[0]))} if judge_by_cat else None),
+        "judge_missing": (judge_total - judge_scored) if judge_enabled else None,
         "predictions_path": str(preds_path),
     }
 
@@ -865,14 +744,10 @@ async def _run_qa_concurrent(
     preds_f,
     done_keys: set[tuple[str, int]],
     concurrency: int,
-    sleep_sec: float,
-    max_retries: int,
-    backoff_sec: float,
-    progress_sec: float,
-    progress_every: int,
+    f1_enabled: bool,
     cat_sum: dict[int, float],
     cat_cnt: dict[int, int],
-    judge_enabled: bool,
+    llm_enabled: bool,
     judge_sum: dict[int, float],
     judge_cnt: dict[int, int],
 ) -> None:
@@ -893,8 +768,6 @@ async def _run_qa_concurrent(
     last_idx: int | None = None
     in_flight = 0
     t0 = time.monotonic()
-    fatal_evt = asyncio.Event()
-    fatal_msg: str | None = None
 
     q: asyncio.Queue[tuple[int, QAItem] | None] = asyncio.Queue()
     for t in tasks:
@@ -904,32 +777,17 @@ async def _run_qa_concurrent(
         q.put_nowait(None)
 
     headers = {"X-User-Id": user_id}
-    timeout = httpx.Timeout(180.0)
+    timeout = httpx.Timeout(600.0)
     async with httpx.AsyncClient(base_url=base_url, timeout=timeout) as client:
-        stop = asyncio.Event()
-
-        async def reporter() -> None:
-            if progress_sec <= 0:
-                return
-            while not stop.is_set():
-                await asyncio.sleep(float(progress_sec))
-                elapsed = max(1e-6, time.monotonic() - t0)
-                rate = completed / elapsed
-                remaining = total_to_run - completed
-                eta = (remaining / rate) if rate > 0 else float("inf")
-                li = last_idx if last_idx is not None else "-"
-                print(
-                    f"qa sample_id={sample_id} done={completed}/{total_to_run} errors={errors} "
-                    f"inflight={in_flight} rate={rate:.2f}/s eta={_fmt_eta(eta)} last={li} "
-                    f"f1_mean_by_cat={_fmt_cat_f1_means(cat_sum, cat_cnt)}"
-                    + (f" judge_mean_by_cat={_fmt_cat_judge_means(judge_sum, judge_cnt)}" if judge_enabled else "")
-                )
+        def _fmt_err(e: Exception) -> str:
+            if isinstance(e, httpx.HTTPStatusError):
+                rid = e.response.headers.get("X-Request-Id") or "-"
+                return f"HTTP {e.response.status_code} request_id={rid}"
+            return f"{type(e).__name__}: {e}"
 
         async def worker() -> None:
-            nonlocal completed, errors, last_idx, fatal_msg, in_flight
+            nonlocal completed, errors, last_idx, in_flight
             while True:
-                if fatal_evt.is_set():
-                    return
                 item = await q.get()
                 if item is None:
                     q.task_done()
@@ -941,11 +799,17 @@ async def _run_qa_concurrent(
                 if qa.now is not None:
                     total_payload["now"] = qa.now.isoformat()
 
+                qa_request_id = f"{user_id}__qa__{qa_idx}"
+                qa_headers = dict(headers)
+                qa_headers["X-Request-Id"] = qa_request_id
+
                 pred_answer = ""
                 evidence = []
+                f1: float | None = None
                 judge_label: str | None = None
                 judge_score: int | None = None
                 judge_reason: str | None = None
+                judge_request_id: str | None = None
                 err = None
                 in_flight += 1
                 try:
@@ -953,30 +817,26 @@ async def _run_qa_concurrent(
                         resp = await _post_json_async(
                             client,
                             "/v1/bench/locomo/qa",
-                            headers=headers,
+                            headers=qa_headers,
                             payload=total_payload,
-                            max_retries=max_retries,
-                            backoff_sec=backoff_sec,
                         )
                         pred_answer = str(resp.get("answer") or "")
                         evidence = resp.get("evidence") or []
                     except Exception as e:
-                        err = f"{type(e).__name__}: {e}"
+                        err = _fmt_err(e)
                         errors += 1
-                        # Stop the whole benchmark run immediately on the first error.
-                        if not fatal_evt.is_set():
-                            fatal_msg = f"qa_failed sample_id={sample_id} qa_idx={qa_idx} error={err}"
-                            fatal_evt.set()
-                        q.task_done()
-                        return
 
-                    f1 = _score_f1(pred_answer=pred_answer, gold_answer=qa.answer, category=qa.category)
-                    if judge_enabled:
+                    if err is None and f1_enabled:
+                        f1 = _score_f1(pred_answer=pred_answer, gold_answer=qa.answer, category=qa.category)
+                    if err is None and llm_enabled:
                         try:
+                            judge_request_id = f"{user_id}__judge__{qa_idx}"
+                            judge_headers = dict(headers)
+                            judge_headers["X-Request-Id"] = judge_request_id
                             jresp = await _post_json_async(
                                 client,
                                 "/v1/bench/locomo/judge",
-                                headers=headers,
+                                headers=judge_headers,
                                 payload={
                                     "question": qa.question,
                                     "gold_answer": qa.answer,
@@ -984,8 +844,6 @@ async def _run_qa_concurrent(
                                     "category": _parse_category_1_5(qa.category),
                                     "now": qa.now.isoformat() if qa.now else None,
                                 },
-                                max_retries=max_retries,
-                                backoff_sec=backoff_sec,
                             )
                             if isinstance(jresp, dict):
                                 judge_label = str(jresp.get("label") or "")
@@ -996,90 +854,57 @@ async def _run_qa_concurrent(
                             if judge_score is None:
                                 raise RuntimeError(f"invalid judge response: {jresp!r}")
                         except Exception as e:
-                            err = f"JudgeError {type(e).__name__}: {e}"
+                            err = "JudgeError " + _fmt_err(e)
                             errors += 1
-                            if not fatal_evt.is_set():
-                                fatal_msg = f"judge_failed sample_id={sample_id} qa_idx={qa_idx} error={err}"
-                                fatal_evt.set()
-                            q.task_done()
-                            return
                 finally:
                     in_flight -= 1
                 row = {
                     "sample_id": sample_id,
                     "user_id": user_id,
                     "qa_idx": qa_idx,
+                    "request_id": qa_request_id,
                     "category": qa.category,
                     "question": qa.question,
                     "gold_answer": qa.answer,
                     "pred_answer": pred_answer,
-                    "f1": f1,
-                    "judge_label": judge_label,
-                    "judge_score": judge_score,
-                    "judge_reason": judge_reason,
                     "now": qa.now.isoformat() if qa.now else None,
                     "evidence_count": len(evidence) if isinstance(evidence, list) else None,
                     "error": err,
                 }
+                if f1_enabled:
+                    row["f1"] = f1
+                if llm_enabled:
+                    row["judge_request_id"] = judge_request_id
+                    row["judge_label"] = judge_label
+                    row["judge_score"] = judge_score
+                    row["judge_reason"] = judge_reason
 
                 async with write_lock:
                     preds_f.write(json.dumps(row, ensure_ascii=False) + "\n")
                     preds_f.flush()
                     done_keys.add((sample_id, qa_idx))
                     cat = _parse_category_1_5(qa.category)
-                    if cat is not None:
-                        cat_sum[cat] = float(cat_sum.get(cat) or 0.0) + _f1_value_or_zero(f1)
-                        cat_cnt[cat] = int(cat_cnt.get(cat) or 0) + 1
-                        if judge_enabled and judge_score is not None:
+                    if cat in _EVALUATED_CATEGORY_IDS:
+                        if f1_enabled:
+                            cat_sum[cat] = float(cat_sum.get(cat) or 0.0) + (float(f1) if isinstance(f1, (int, float)) else 0.0)
+                            cat_cnt[cat] = int(cat_cnt.get(cat) or 0) + 1
+                        if llm_enabled and judge_score is not None:
                             judge_sum[cat] = float(judge_sum.get(cat) or 0.0) + float(judge_score)
                             judge_cnt[cat] = int(judge_cnt.get(cat) or 0) + 1
                     completed += 1
-                    if progress_every and completed % int(progress_every) == 0:
-                        elapsed = max(1e-6, time.monotonic() - t0)
-                        rate = completed / elapsed
-                        remaining = total_to_run - completed
-                        eta = (remaining / rate) if rate > 0 else float("inf")
-                        print(
-                            f"qa sample_id={sample_id} done={completed}/{total_to_run} errors={errors} "
-                            f"inflight={in_flight} rate={rate:.2f}/s eta={_fmt_eta(eta)} last={qa_idx} "
-                            f"f1_mean_by_cat={_fmt_cat_f1_means(cat_sum, cat_cnt)}"
-                            + (f" judge_mean_by_cat={_fmt_cat_judge_means(judge_sum, judge_cnt)}" if judge_enabled else "")
-                        )
 
-                if sleep_sec and sleep_sec > 0:
-                    await asyncio.sleep(float(sleep_sec))
                 q.task_done()
 
-        report_task = asyncio.create_task(reporter())
         workers = [asyncio.create_task(worker()) for _ in range(max(1, int(concurrency)))]
-        join_task = asyncio.create_task(q.join())
-        fatal_wait = asyncio.create_task(fatal_evt.wait())
-        done, pending = await asyncio.wait({join_task, fatal_wait}, return_when=asyncio.FIRST_COMPLETED)
-
-        if fatal_evt.is_set():
-            for t in pending:
-                t.cancel()
-            for w in workers:
-                w.cancel()
-            stop.set()
-            report_task.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
-            if fatal_msg:
-                raise RuntimeError(fatal_msg)
-            raise RuntimeError("qa_failed")
-
-        for t in pending:
-            t.cancel()
-        stop.set()
-        await report_task
+        await q.join()
         for w in workers:
             await w
 
     elapsed = max(1e-6, time.monotonic() - t0)
     print(
         f"qa sample_id={sample_id} done={completed}/{total_to_run} errors={errors} elapsed={_fmt_eta(elapsed)} "
-        f"f1_mean_by_cat={_fmt_cat_f1_means(cat_sum, cat_cnt)}"
-        + (f" judge_mean_by_cat={_fmt_cat_judge_means(judge_sum, judge_cnt)}" if judge_enabled else "")
+        + (f"f1_mean_by_cat={_fmt_cat_f1_means(cat_sum, cat_cnt)} " if f1_enabled else "")
+        + (f"judge_mean_by_cat={_fmt_cat_judge_means(judge_sum, judge_cnt)}" if llm_enabled else "")
     )
 
 
@@ -1097,88 +922,55 @@ def _download_file(*, url: str, dest: Path, timeout_sec: float = 120.0) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="LoCoMo benchmark runner: ingest + QA + F1 report")
+    ap = argparse.ArgumentParser(description="LoCoMo benchmark runner: ingest + QA + metrics report")
     ap.add_argument(
         "--data",
         default=None,
-        help="Path to locomo10.json. If omitted, defaults to ./data/locomo/locomo10.json (auto-download if missing).",
-    )
-    ap.add_argument(
-        "--download-url",
-        default="https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json",
-        help="URL to download locomo10.json from (used with --download).",
-    )
-    ap.add_argument(
-        "--force-download",
-        action="store_true",
-        help="Overwrite existing --data file when used with --download.",
-    )
-    ap.add_argument(
-        "--no-download",
-        action="store_true",
-        help="Do not download locomo10.json automatically; fail if --data does not exist.",
+        help="Path to an existing locomo10.json. If omitted or not found, it will be downloaded to ./data/locomo/locomo10.json.",
     )
     ap.add_argument("--base-url", default="http://127.0.0.1:8001", help="NoMemory service base URL.")
     ap.add_argument("--outdir", default="traces/locomo", help="Output directory for results.")
-    ap.add_argument("--user-prefix", default="locomo", help="User id prefix.")
-    ap.add_argument("--run-id", default=None, help="Run id suffix. Default: UTC timestamp.")
-    ap.add_argument("--limit-samples", type=int, default=None, help="Limit number of dialogue samples.")
-    ap.add_argument("--limit-qa", type=int, default=None, help="Limit number of QA items per sample.")
-    ap.add_argument("--sleep-sec", type=float, default=0.0, help="Sleep seconds between QA calls.")
-    ap.add_argument("--wait-embeddings-sec", type=float, default=0.0, help="(Optional) Extra sleep after ingest. Embeddings are now waited for automatically by default.")
-    ap.add_argument("--embeddings-timeout-sec", type=float, default=120.0, help="Max seconds to wait for embeddings after ingest.")
-    ap.add_argument("--no-wait-embeddings", action="store_true", help="Do not wait for embeddings after ingest.")
-    ap.add_argument("--resume", action="store_true", help="Resume an existing run (requires --run-id; appends to predictions.jsonl).")
+    ap.add_argument("--run-id", default=None, help="Resume an existing run id under --outdir (must already exist).")
     ap.add_argument("--concurrency", type=int, default=2, help="Number of concurrent QA requests (default: 2).")
-    ap.add_argument("--max-retries", type=int, default=3, help="Max retries per QA request on retryable errors (default: 3).")
-    ap.add_argument("--retry-backoff-sec", type=float, default=1.0, help="Base backoff seconds for retries (default: 1.0).")
-    ap.add_argument("--skip-ingest", action="store_true", help="Skip ingest and only run QA (useful with --resume).")
-    ap.add_argument("--progress-sec", type=float, default=5.0, help="Print progress every N seconds during QA (default: 5).")
-    ap.add_argument("--progress-every", type=int, default=10, help="Print progress every N completed QA (default: 10).")
-    ap.add_argument("--judge", action="store_true", help="Compute LLM-as-judge metric (requires /v1/bench/locomo/judge).")
-    ap.add_argument("--judge-concurrency", type=int, default=2, help="Concurrent judge requests for backfill (default: 2).")
-    ap.add_argument("--only-category", default=None, help="Run only one QA category (1-5 or name, e.g. temporal).")
+    ap.add_argument("--metrics", default="f1,llm", help="Comma/space-separated metrics to compute during evaluation: f1,llm (default: f1,llm).")
+    ap.add_argument("--only-category", default=None, help="Run only one QA category (1-4 or name, e.g. temporal). Adversarial is disabled.")
     ap.add_argument("--log-file", default=None, help="Append stdout/stderr logs to this file.")
     ap.add_argument("--summarize-only", action="store_true", help="Only (re)write summary.json from predictions.jsonl; do not ingest or run QA.")
-    ap.add_argument("--overwrite", action="store_true", help="Allow overwriting an existing run's predictions.jsonl when not using --resume.")
     args = ap.parse_args()
 
-    if args.summarize_only and not args.run_id:
+    resume_mode = bool(args.run_id)
+    if args.summarize_only and not resume_mode:
         raise ValueError("--summarize-only requires --run-id")
-    if args.resume and not args.run_id:
-        raise ValueError("--resume requires --run-id")
     if args.concurrency is None or int(args.concurrency) <= 0:
         raise ValueError("--concurrency must be >= 1")
-    if args.max_retries is None or int(args.max_retries) < 0:
-        raise ValueError("--max-retries must be >= 0")
-    if args.retry_backoff_sec is None or float(args.retry_backoff_sec) <= 0:
-        raise ValueError("--retry-backoff-sec must be > 0")
-    if args.judge_concurrency is None or int(args.judge_concurrency) <= 0:
-        raise ValueError("--judge-concurrency must be >= 1")
+    metrics = _parse_metrics_arg(args.metrics)
     only_cat = _parse_only_category_arg(args.only_category)
     if args.only_category is not None and only_cat is None:
-        raise ValueError(f"--only-category invalid: {args.only_category!r} (expected 1-5 or a name like temporal)")
+        raise ValueError(f"--only-category invalid: {args.only_category!r} (expected 1-4 or a name like temporal)")
+    if only_cat == 5:
+        raise ValueError("--only-category adversarial is not supported (Adversarial is disabled in this runner).")
 
-    data_path = Path(args.data) if args.data else Path("data/locomo/locomo10.json")
+    default_data_path = Path("data/locomo/locomo10.json")
+    data_path = Path(args.data) if (args.data and Path(args.data).exists()) else default_data_path
     if not data_path.exists():
-        if args.no_download:
-            raise FileNotFoundError(f"--data not found: {data_path}")
-        print(f"download locomo10.json url={args.download_url} dest={data_path}")
-        _download_file(url=str(args.download_url), dest=data_path)
-    elif args.force_download:
-        if args.no_download:
-            raise ValueError("--force-download conflicts with --no-download")
-        print(f"download locomo10.json url={args.download_url} dest={data_path} (force)")
-        _download_file(url=str(args.download_url), dest=data_path)
+        print(f"download locomo10.json url={DEFAULT_LOCOMO_URL} dest={default_data_path}")
+        _download_file(url=DEFAULT_LOCOMO_URL, dest=default_data_path)
+        data_path = default_data_path
 
     raw = json.loads(data_path.read_text(encoding="utf-8"))
     samples = _extract_locomo_samples(raw)
-    if args.limit_samples is not None:
-        samples = samples[: max(0, int(args.limit_samples))]
 
-    run_id = args.run_id or _now_utc().strftime("%Y%m%dT%H%M%SZ")
+    run_id = str(args.run_id) if resume_mode else _now_utc().strftime("%Y%m%dT%H%M%SZ")
     outdir = Path(args.outdir) / run_id
-    outdir.mkdir(parents=True, exist_ok=True)
+    if resume_mode:
+        if not outdir.exists():
+            raise FileNotFoundError(f"--run-id not found under --outdir: {outdir}")
+        if not outdir.is_dir():
+            raise NotADirectoryError(f"--run-id is not a directory: {outdir}")
+    else:
+        if outdir.exists():
+            raise FileExistsError(f"Refusing to overwrite existing run directory: {outdir}")
+        outdir.mkdir(parents=True, exist_ok=False)
 
     preds_path = outdir / "predictions.jsonl"
     summary_path = outdir / "summary.json"
@@ -1207,33 +999,32 @@ def main() -> int:
         atexit.register(_restore)
 
     mapping: dict[str, str] = {}
-    if args.resume and mapping_path.exists():
-        try:
-            obj = json.loads(mapping_path.read_text(encoding="utf-8"))
-            mapping = obj if isinstance(obj, dict) else {}
-        except Exception:
-            mapping = {}
+    if resume_mode:
+        if not preds_path.exists():
+            raise FileNotFoundError(f"Missing predictions file for --run-id: {preds_path}")
+        if not mapping_path.exists():
+            raise FileNotFoundError(f"Missing user mapping file for --run-id: {mapping_path}")
+        obj = json.loads(mapping_path.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            raise ValueError(f"Invalid user mapping file (expected JSON object): {mapping_path}")
+        mapping = {str(k): str(v) for (k, v) in obj.items()}
 
-    if args.resume:
-        removed = _cleanup_prediction_errors(preds_path=preds_path)
-        if removed:
-            print(f"resume cleanup removed_error_rows={removed} moved_to={preds_path.with_name('predictions.errors.jsonl')}")
+        if not args.summarize_only:
+            removed = _cleanup_prediction_errors(preds_path=preds_path)
+            if removed:
+                print(
+                    f"resume cleanup removed_error_rows={removed} moved_to={preds_path.with_name('predictions.errors.jsonl')}"
+                )
 
     run_cat_sum = _new_cat_sums()
     run_cat_cnt = _new_cat_counts()
     run_judge_sum = _new_cat_sums()
     run_judge_cnt = _new_cat_counts()
-    if args.judge and preds_path.exists() and (args.resume or args.summarize_only):
-        _backfill_missing_judge(
-            preds_path=preds_path,
-            base_url=str(args.base_url),
-            max_retries=int(args.max_retries),
-            backoff_sec=float(args.retry_backoff_sec),
-            concurrency=int(args.judge_concurrency),
-        )
     if preds_path.exists():
-        run_cat_sum, run_cat_cnt = _cat_f1_totals_from_predictions(preds_path)
-        run_judge_sum, run_judge_cnt = _cat_judge_totals_from_predictions(preds_path)
+        if "f1" in metrics:
+            run_cat_sum, run_cat_cnt = _cat_f1_totals_from_predictions(preds_path)
+        if "llm" in metrics:
+            run_judge_sum, run_judge_cnt = _cat_judge_totals_from_predictions(preds_path)
 
     if args.summarize_only:
         summary = _compute_summary_from_predictions(
@@ -1246,12 +1037,11 @@ def main() -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
-    done_keys = _completed_keys_from_predictions(preds_path) if args.resume else set()
+    done_keys = _completed_keys_from_predictions(preds_path, required_metrics=metrics) if resume_mode else set()
 
-    if not args.resume:
-        if preds_path.exists() and preds_path.stat().st_size > 0 and not args.overwrite:
-            raise ValueError(f"Run already has results: {preds_path}. Use --resume or --overwrite.")
+    if not resume_mode:
         preds_path.write_text("", encoding="utf-8")
+        mapping_path.write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         run_cat_sum = _new_cat_sums()
         run_cat_cnt = _new_cat_counts()
         run_judge_sum = _new_cat_sums()
@@ -1259,15 +1049,14 @@ def main() -> int:
 
     print(
         f"run start run_id={run_id} samples={len(samples)} base_url={args.base_url} "
-        f"resume={bool(args.resume)} concurrency={int(args.concurrency)} outdir={outdir}"
+        f"concurrency={int(args.concurrency)} outdir={outdir}"
     )
-    if not args.skip_ingest and not bool(args.no_wait_embeddings):
-        print("note: waiting for embeddings after ingest (use --no-wait-embeddings to disable).")
+    print(f"metrics={','.join(sorted(metrics))} (computed during evaluation)")
 
     with preds_path.open("a", encoding="utf-8") as preds_f, httpx.Client(base_url=args.base_url, timeout=120.0) as client:
         for sample_idx, sample in enumerate(samples, start=1):
             sample_id = str(sample.get("sample_id") or sample.get("dia_id") or f"sample_{sample_idx}")
-            user_id = mapping.get(sample_id) or _sanitize_user_id(f"{args.user_prefix}_{run_id}_{sample_id}")
+            user_id = mapping.get(sample_id) or _sanitize_user_id(f"{FIXED_USER_PREFIX}_{run_id}_{sample_id}")
             mapping[sample_id] = user_id
             mapping_path.write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -1276,58 +1065,43 @@ def main() -> int:
             if not turns:
                 continue
 
-            if not args.skip_ingest:
-                inserted_total = 0
-                ignored_total = 0
-                items = []
-                for t in turns:
-                    locomo = (t.meta or {}).get("locomo") if isinstance(t.meta, dict) else {}
-                    session = (locomo or {}).get("session")
-                    dia_id = (locomo or {}).get("dia_id")
-                    mid = _stable_id_hex(sample_id, session, dia_id)
-                    items.append(
-                        {
-                            "message_id": mid,
-                            "ts": t.ts.isoformat(),
-                            "role": t.role,
-                            "content": t.content,
-                            "meta": t.meta,
-                        }
-                    )
-                for chunk in _chunk(items, 500):
-                    resp = _post_json(client, f"/v1/users/{user_id}/messages:batch", payload={"items": chunk})
-                    if isinstance(resp, dict):
-                        inserted_total += int(resp.get("inserted") or 0)
-                        ignored_total += int(resp.get("ignored") or 0)
-                print(
-                    f"ingest sample_id={sample_id} items={len(items)} inserted={inserted_total} ignored={ignored_total}"
+            inserted_total = 0
+            ignored_total = 0
+            items = []
+            for t in turns:
+                locomo = (t.meta or {}).get("locomo") if isinstance(t.meta, dict) else {}
+                session = (locomo or {}).get("session")
+                dia_id = (locomo or {}).get("dia_id")
+                mid = _stable_id_hex(sample_id, session, dia_id)
+                items.append(
+                    {
+                        "message_id": mid,
+                        "ts": t.ts.isoformat(),
+                        "role": t.role,
+                        "content": t.content,
+                        "meta": t.meta,
+                    }
                 )
-                if not bool(args.no_wait_embeddings):
-                    try:
-                        _wait_for_embeddings(
-                            client,
-                            user_id=user_id,
-                            expected=int(inserted_total),
-                            timeout_sec=float(args.embeddings_timeout_sec),
-                        )
-                    except TimeoutError as e:
-                        print(f"warn: {e}")
-            else:
-                print(f"ingest sample_id={sample_id} skipped items={len(turns)}")
+            for chunk in _chunk(items, 500):
+                resp = _post_json(client, f"/v1/users/{user_id}/messages:batch", payload={"items": chunk})
+                if isinstance(resp, dict):
+                    inserted_total += int(resp.get("inserted") or 0)
+                    ignored_total += int(resp.get("ignored") or 0)
+            print(f"ingest sample_id={sample_id} items={len(items)} inserted={inserted_total} ignored={ignored_total}")
 
-            if args.wait_embeddings_sec and args.wait_embeddings_sec > 0:
-                time.sleep(float(args.wait_embeddings_sec))
+            _wait_for_embeddings(client, user_id=user_id)
 
             fallback_now = turns[-1].ts if turns else None
             qa_items = _extract_qa(sample, fallback_now=fallback_now)
+            qa_items = [qa for qa in qa_items if _parse_category_1_5(qa.category) in _EVALUATED_CATEGORY_IDS]
             if only_cat is not None:
                 qa_items = [qa for qa in qa_items if _parse_category_1_5(qa.category) == only_cat]
-            if args.limit_qa is not None:
-                qa_items = qa_items[: max(0, int(args.limit_qa))]
 
             already_done = sum(1 for qa in qa_items if (sample_id, int(qa.qa_idx)) in done_keys)
             remaining = len(qa_items) - already_done
-            print(f"qa sample_id={sample_id} total={len(qa_items)} done={already_done} remaining={remaining} concurrency={int(args.concurrency)}")
+            print(
+                f"qa sample_id={sample_id} total={len(qa_items)} done={already_done} remaining={remaining} concurrency={int(args.concurrency)}"
+            )
             asyncio.run(
                 _run_qa_concurrent(
                     base_url=args.base_url,
@@ -1337,14 +1111,10 @@ def main() -> int:
                     preds_f=preds_f,
                     done_keys=done_keys,
                     concurrency=int(args.concurrency),
-                    sleep_sec=float(args.sleep_sec or 0.0),
-                    max_retries=int(args.max_retries),
-                    backoff_sec=float(args.retry_backoff_sec),
-                    progress_sec=float(args.progress_sec or 0.0),
-                    progress_every=int(args.progress_every or 0),
+                    f1_enabled=("f1" in metrics),
                     cat_sum=run_cat_sum,
                     cat_cnt=run_cat_cnt,
-                    judge_enabled=bool(args.judge),
+                    llm_enabled=("llm" in metrics),
                     judge_sum=run_judge_sum,
                     judge_cnt=run_judge_cnt,
                 )

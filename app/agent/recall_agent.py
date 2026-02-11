@@ -564,6 +564,7 @@ class RecallAgent:
             "工具调用必须使用 tool_calls（函数调用）方式；工具结果会以 role=tool 的消息追加到对话里。\n"
             "运行时会在每次工具调用后做硬约束：若返回 items 过多，会按时间倒序（最新在前）截断到 max_tool_items，并告知 total_items 与截断原因。\n"
             "硬性要求：messages_list/lexical_search/semantic_search 必须显式提供 time_range 与 role（role 可为 any）。若 since/until 均为空，则表示全时间范围。\n"
+            "注意：在 JSON 里空值必须用 null（或直接省略字段）；不要写字符串 \"None\" / \"null\" 作为占位。\n"
             "role 取值：user / assistant / any（any=不按 role 过滤）。\n"
             "硬性要求：拿不准、且允许不填的参数就不要填写（例如 until/cursor/min_score/page_size/top_k/before/after 等），让运行时默认值接管。\n"
             "重要：请预留至少 1 次迭代用于最终合成输出（输出最终 JSON）；不要把最后一次迭代用在工具调用上。\n"
