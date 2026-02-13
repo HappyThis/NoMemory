@@ -91,6 +91,15 @@ class EmbeddingsStatusResponse(BaseModel):
     latest_embedding_at: Optional[datetime] = None
 
 
+class EmbeddingsEnqueueResponse(BaseModel):
+    user_id: str
+    provider: str
+    model: str
+    enabled: bool
+    missing: int
+    scheduled: int
+
+
 class NeighborsResponse(BaseModel):
     items: list[ChatMessage]
 

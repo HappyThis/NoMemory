@@ -1,0 +1,54 @@
+{
+  "run_id": "20260213T015814Z",
+  "base_url": "http://127.0.0.1:8001",
+  "samples": 10,
+  "qa_total": 1540,
+  "qa_errors": 3,
+  "qa_error_rate": 0.001948051948051948,
+  "qa_scored": 1534,
+  "f1_total": 1540,
+  "f1_scored": 1534,
+  "f1_mean": 0.5836739475113077,
+  "f1_by_category": {
+    "Multi-hop": {
+      "count": 282,
+      "mean": 0.3944752005395304
+    },
+    "Temporal": {
+      "count": 321,
+      "mean": 0.5998392066995617
+    },
+    "Open-domain": {
+      "count": 96,
+      "mean": 0.26695414051055216
+    },
+    "Single-hop": {
+      "count": 841,
+      "mean": 0.677098560969912
+    }
+  },
+  "f1_missing": 6,
+  "judge_total": 1540,
+  "judge_scored": 1537,
+  "judge_mean": 0.7201298701298702,
+  "judge_by_category": {
+    "Multi-hop": {
+      "count": 282,
+      "mean": 0.41843971631205673
+    },
+    "Temporal": {
+      "count": 321,
+      "mean": 0.7383177570093458
+    },
+    "Open-domain": {
+      "count": 96,
+      "mean": 0.5
+    },
+    "Single-hop": {
+      "count": 841,
+      "mean": 0.8394768133174791
+    }
+  },
+  "judge_missing": 3,
+  "predictions_path": "experiments/locomo/20260213T015814Z/predictions.jsonl"
+}

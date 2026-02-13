@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from app.api.schemas import (
     ChatMessage,
+    EmbeddingsEnqueueResponse,
     EmbeddingsStatusResponse,
     LexicalSearchRequest,
     NeighborsResponse,
@@ -20,7 +21,7 @@ from app.api.schemas import (
 from app.db.models import Message, MessageEmbedding
 from app.db.session import get_db
 from app.llm.bigmodel import BigModelError
-from app.llm.embeddings import embed_query_text
+from app.llm.embeddings import embed_query_text, enqueue_embeddings_for_messages
 from app.retrieval.lexical import LexicalAnchor, lexical_search
 from app.retrieval.messages import list_messages
 from app.retrieval.neighbors import get_neighbors
@@ -135,6 +136,73 @@ def embeddings_status(
         embeddings=int(embeddings or 0),
         candidates=int(candidates or 0),
         latest_embedding_at=latest,
+    )
+
+
+@router.post("/users/{user_id}/embeddings/enqueue", response_model=EmbeddingsEnqueueResponse)
+def embeddings_enqueue(
+    user_id: str,
+    background: BackgroundTasks,
+    provider: Optional[str] = Query(default=None),
+    model: Optional[str] = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+    db: Session = Depends(get_db),
+) -> EmbeddingsEnqueueResponse:
+    provider_val = provider or settings.embedding_provider
+    model_val = model or settings.bigmodel_embedding_model
+    enabled = bool(settings.bigmodel_api_key) and provider_val == "bigmodel"
+
+    if not enabled:
+        return EmbeddingsEnqueueResponse(
+            user_id=user_id,
+            provider=str(provider_val),
+            model=str(model_val),
+            enabled=False,
+            missing=0,
+            scheduled=0,
+        )
+
+    join_cond = and_(
+        MessageEmbedding.user_id == Message.user_id,
+        MessageEmbedding.message_id == Message.message_id,
+        MessageEmbedding.provider == provider_val,
+        MessageEmbedding.model == model_val,
+    )
+
+    missing = db.execute(
+        select(func.count())
+        .select_from(Message)
+        .outerjoin(MessageEmbedding, join_cond)
+        .where(Message.user_id == user_id, MessageEmbedding.message_id.is_(None))
+    ).scalar_one()
+
+    rows = db.execute(
+        select(Message.user_id, Message.message_id, Message.content)
+        .select_from(Message)
+        .outerjoin(MessageEmbedding, join_cond)
+        .where(Message.user_id == user_id, MessageEmbedding.message_id.is_(None))
+        .order_by(Message.ts.asc())
+        .limit(int(limit))
+    ).all()
+
+    now = datetime.now(tz=timezone.utc)
+    scheduled = len(rows)
+    if scheduled:
+        background.add_task(
+            enqueue_embeddings_for_messages,
+            [(r[0], r[1], r[2]) for r in rows],
+            provider=str(provider_val),
+            model=str(model_val),
+            requested_at=now,
+        )
+
+    return EmbeddingsEnqueueResponse(
+        user_id=user_id,
+        provider=str(provider_val),
+        model=str(model_val),
+        enabled=True,
+        missing=int(missing or 0),
+        scheduled=int(scheduled),
     )
 
 

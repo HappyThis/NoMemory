@@ -323,6 +323,8 @@ def _wait_for_embeddings(client: httpx.Client, *, user_id: str) -> None:
     sleep_s = 0.25
     last_emb = -1
     last_msgs = -1
+    last_print = 0.0
+    enqueued = False
     while True:
         status = _get_json(client, f"/v1/users/{user_id}/embeddings/status")
         enabled = bool(status.get("enabled"))
@@ -337,9 +339,23 @@ def _wait_for_embeddings(client: httpx.Client, *, user_id: str) -> None:
 
         elapsed = time.monotonic() - t0
 
+        # If this user already has messages but embeddings are behind (common in resume where inserted=0),
+        # try to (re)enqueue missing embeddings once so we don't wait forever on a stalled background task.
+        if not enqueued:
+            try:
+                _post_json(client, f"/v1/users/{user_id}/embeddings/enqueue", payload={})
+                enqueued = True
+            except Exception:
+                # Best-effort; keep waiting.
+                enqueued = True
+
         if emb != last_emb or msgs != last_msgs:
             last_emb = emb
             last_msgs = msgs
+            last_print = time.monotonic()
+            print(f"wait embeddings user_id={user_id} embeddings={emb}/{msgs} elapsed={_fmt_eta(elapsed)}")
+        elif (time.monotonic() - last_print) >= 30.0:
+            last_print = time.monotonic()
             print(f"wait embeddings user_id={user_id} embeddings={emb}/{msgs} elapsed={_fmt_eta(elapsed)}")
         time.sleep(sleep_s)
         sleep_s = min(2.0, sleep_s * 1.5)

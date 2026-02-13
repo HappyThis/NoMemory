@@ -76,6 +76,21 @@ Skills 的目标是“同一份事件数据，用不同策略生成不同的记�
 | Open-domain | 96 | 0.2464 | 0.5000 |
 | Single-hop | 841 | 0.6443 | 0.8680 |
 
+### 20260213T015814Z（GLM-5）
+
+产物目录：`experiments/locomo/20260213T015814Z/`
+
+| run_id | samples | qa_total | f1_mean | judge_mean | summary |
+|---|---:|---:|---:|---:|---|
+| `20260213T015814Z` | 10 | 1540 | 0.5837 | 0.7201 | `experiments/locomo/20260213T015814Z/summary.json` |
+
+| Category | Count | F1 Mean | Judge Mean |
+|---|---:|---:|---:|
+| Multi-hop | 282 | 0.3945 | 0.4184 |
+| Temporal | 321 | 0.5998 | 0.7383 |
+| Open-domain | 96 | 0.2670 | 0.5000 |
+| Single-hop | 841 | 0.6771 | 0.8395 |
+
 ## Quickstart（本地跑起来）
 
 0) 一键启动（推荐）
